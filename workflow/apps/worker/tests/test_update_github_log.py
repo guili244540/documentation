@@ -3,6 +3,8 @@
 The GitHub REST API is replaced with an ``httpx.MockTransport`` through the
 ``_github_async_client`` seam, so no test reaches the network. The workbook
 editing itself (openpyxl) runs for real, exactly as it will in the worker.
+The fixture mirrors ``Response Repository Matrix.xlsx``: a ``Test Log`` sheet
+with its header row on row 4 plus a ``Lists`` sheet holding the dropdown values.
 """
 
 import asyncio
@@ -29,15 +31,43 @@ from worker.workflows.update_github_log import (
 WORKFLOW_EXECUTION_TIMEOUT = timedelta(seconds=10)
 CLIENT_TIMEOUT = 15
 
+LISTS_SHEET = {
+    "Service / Team": ["CFU", "Invoice-Supplier Team", "Inventory Team", "Budget Unit", "Accounting"],
+    "Question Type": ["How-to / procedure", "Contract / rule", "System issue", "Accounting / budget", "Other"],
+    "Quality Rating": [1, 2, 3, 4, 5],
+    "Correction Level": ["None", "Minor wording", "Moderate changes", "Major changes", "Rewritten / unusable"],
+    "Outcome": ["Used as generated", "Used after editing", "Not used", "Escalated / expert review"],
+    "Validated for Reuse": ["Yes", "No"],
+    "Error Category": [
+        "No error",
+        "Incorrect fact",
+        "Missing information",
+        "Outdated information",
+        "Misinterpretation",
+        "Unsupported / invented claim",
+        "Wrong tone / wording",
+        "Other",
+    ],
+}
+
 
 def make_workbook_b64(rows: list[list[object]]) -> str:
-    """A workbook shaped like TestLog.xlsx: header row + the given data rows."""
+    """A workbook shaped like the repository matrix: headers on row 4 of ``Test Log``."""
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Sheet1"
-    ws.append(EXPECTED_HEADERS)
-    for row in rows:
-        ws.append(row)
+    ws.title = "Test Log"
+    ws["A1"] = "Test Log"
+    ws["A2"] = "One row per real-life test."
+    for col, header in enumerate(EXPECTED_HEADERS, start=1):
+        ws.cell(row=4, column=col, value=header)
+    for offset, row in enumerate(rows):
+        for col, value in enumerate(row, start=1):
+            ws.cell(row=5 + offset, column=col, value=value)
+    lists = wb.create_sheet("Lists")
+    for col, (header, values) in enumerate(LISTS_SHEET.items(), start=1):
+        lists.cell(row=1, column=col, value=header)
+        for offset, value in enumerate(values):
+            lists.cell(row=2 + offset, column=col, value=value)
     buffer = io.BytesIO()
     wb.save(buffer)
     return base64.b64encode(buffer.getvalue()).decode("ascii")
@@ -55,7 +85,7 @@ class FakeGitHub:
         if request.method == "GET":
             return httpx.Response(
                 200,
-                json={"sha": self.blob_sha, "content": self.content},
+                json={"sha": self.blob_sha, "content": self.content, "encoding": "base64"},
             )
         if request.method == "PUT":
             payload = json.loads(request.content)
@@ -104,7 +134,7 @@ async def start_and_run(temporal_env, input: dict) -> dict:
 
 
 async def test_dry_run_writes_nothing(temporal_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeGitHub(make_workbook_b64([[1, "Invoice-Supplier Team", None, 5, None]]))
+    fake = FakeGitHub(make_workbook_b64([[1, "Invoice-Supplier Team", None, None, None, 5]]))
     install_fake_github(monkeypatch, fake)
 
     result = await start_and_run(
@@ -122,8 +152,8 @@ async def test_appends_next_test_id_and_verifies(
     temporal_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     rows = [
-        [1, "Invoice-Supplier Team", None, 5, None],
-        [2, None, None, 3, None],
+        [1, "Invoice-Supplier Team", None, None, None, 5, None, None, None, None, None, 3],
+        [2, None, None, None, None, 3, None, None, None, None, None, 2],
     ]
     fake = FakeGitHub(make_workbook_b64(rows))
     install_fake_github(monkeypatch, fake)
@@ -131,8 +161,14 @@ async def test_appends_next_test_id_and_verifies(
     entry = {
         "question": "Can Mistral Vibe Work write to a github repo ?",
         "quality": 5,
-        "service_team": "Workflows Team",
-        "error_category": None,
+        "service_team": "invoice-supplier team",
+        "prompt_used": "Please answer the question.",
+        "mistral_answer": "Yes, via a deployed workflow.",
+        "error_category": "No error",
+        "correction_level": "None",
+        "outcome": "Used as generated",
+        "validated_for_reuse": True,
+        "prompt_review_count": 1,
     }
     result = await start_and_run(temporal_env, {"entry": entry})
 
@@ -147,19 +183,31 @@ async def test_appends_next_test_id_and_verifies(
     wb = openpyxl.load_workbook(
         io.BytesIO(base64.b64decode(fake.put_payloads[0]["content"]))
     )
-    ws = wb["Sheet1"]
-    stored = [[c.value for c in row] for row in ws.iter_rows(max_col=5)]
-    assert stored[-1] == [
+    ws = wb["Test Log"]
+    assert [c.value for c in ws[4]][:12] == EXPECTED_HEADERS
+    stored = [c.value for c in ws[7]][:12]
+    assert stored == [
         3,
-        "Workflows Team",
+        "Invoice-Supplier Team",  # canonicalised from the lower-case input
         "Can Mistral Vibe Work write to a github repo ?",
+        "Please answer the question.",
+        "Yes, via a deployed workflow.",
         5,
+        "No error",
+        "None",
         None,
+        "Used as generated",
+        "Yes",  # boolean written as the sheet's Yes/No vocabulary
+        1,
     ]
+    # The dropdowns openpyxl drops have been rebuilt from the Lists sheet.
+    validations = {str(d.sqref): d.formula1 for d in ws.data_validations.dataValidation}
+    assert '"CFU,Invoice-Supplier Team,Inventory Team,Budget Unit,Accounting"' in validations.values()
+    assert '"Used as generated,Used after editing,Not used,Escalated / expert review"' in validations.values()
 
 
 async def test_explicit_test_id_is_used(temporal_env, monkeypatch: pytest.MonkeyPatch) -> None:
-    fake = FakeGitHub(make_workbook_b64([[1, None, "old", 5, None]]))
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
     install_fake_github(monkeypatch, fake)
 
     result = await start_and_run(
@@ -172,7 +220,7 @@ async def test_explicit_test_id_is_used(temporal_env, monkeypatch: pytest.Monkey
 async def test_duplicate_test_id_fails_the_run(
     temporal_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = FakeGitHub(make_workbook_b64([[1, None, "old", 5, None]]))
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
     install_fake_github(monkeypatch, fake)
 
     with pytest.raises(Exception, match="Test ID 1 already exists"):
@@ -186,7 +234,7 @@ async def test_duplicate_test_id_fails_the_run(
 async def test_quality_rating_is_validated(
     temporal_env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fake = FakeGitHub(make_workbook_b64([[1, None, "old", 5, None]]))
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
     install_fake_github(monkeypatch, fake)
 
     with pytest.raises(Exception):
@@ -195,3 +243,36 @@ async def test_quality_rating_is_validated(
         )
 
     assert fake.put_payloads == []
+
+
+async def test_unknown_service_team_is_rejected(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+
+    with pytest.raises(Exception, match="invalid_service_team"):
+        await start_and_run(
+            temporal_env,
+            {"entry": {"question": "Who?", "quality": 5, "service_team": "Zen Team"}},
+        )
+
+    assert fake.put_payloads == []
+
+
+async def test_missing_headers_fail_the_read(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Test Log"
+    ws["A1"] = "Not the expected header"
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    fake = FakeGitHub(base64.b64encode(buffer.getvalue()).decode("ascii"))
+    install_fake_github(monkeypatch, fake)
+
+    with pytest.raises(Exception, match="unexpected_sheet_structure"):
+        await start_and_run(
+            temporal_env, {"entry": {"question": "?", "quality": 5}, "dry_run": True}
+        )
