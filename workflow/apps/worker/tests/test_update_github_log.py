@@ -276,3 +276,72 @@ async def test_missing_headers_fail_the_read(
         await start_and_run(
             temporal_env, {"entry": {"question": "?", "quality": 5}, "dry_run": True}
         )
+
+
+async def test_update_existing_test_id_fills_fields_in_place(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = [[1, None, "Old question", None, None, 4, None, None, None, None, "Yes", None]]
+    fake = FakeGitHub(make_workbook_b64(rows))
+    install_fake_github(monkeypatch, fake)
+
+    entry = {
+        "question": "Old question",
+        "quality": 4,
+        "service_team": "Accounting",
+        "error_category": "No error",
+        "correction_level": "None",
+        "outcome": "Used as generated",
+        "validated_for_reuse": True,
+        "prompt_review_count": 1,
+        "test_id": 1,
+    }
+    result = await start_and_run(temporal_env, {"entry": entry, "update_existing": True})
+
+    assert result["dry_run"] is False
+    assert result["test_id"] == 1
+    assert result["commit_sha"] == "commit-1"
+    assert result["verified"] is True
+
+    assert len(fake.put_payloads) == 1
+    wb = openpyxl.load_workbook(
+        io.BytesIO(base64.b64decode(fake.put_payloads[0]["content"]))
+    )
+    ws = wb["Test Log"]
+    # The existing row 5 is updated in place, not appended: same row count.
+    assert ws.max_row == 5
+    stored = [c.value for c in ws[5]][:12]
+    assert stored == [
+        1,
+        "Accounting",
+        "Old question",
+        None,  # never provided on update: existing content kept
+        None,
+        4,
+        "No error",
+        "None",
+        None,
+        "Used as generated",
+        "Yes",
+        1,
+    ]
+
+
+async def test_update_requires_existing_explicit_test_id(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+
+    with pytest.raises(Exception, match="not found in the log"):
+        await start_and_run(
+            temporal_env,
+            {"entry": {"question": "Missing", "quality": 4, "test_id": 9}, "update_existing": True},
+        )
+
+    with pytest.raises(Exception, match="explicit test_id"):
+        await start_and_run(
+            temporal_env, {"entry": {"question": "No id", "quality": 4}, "update_existing": True}
+        )
+
+    assert fake.put_payloads == []
