@@ -1,4 +1,4 @@
-"""Append a test entry to ``Response Repository Matrix.xlsx`` in the ``guili244540/documentation`` GitHub repository.
+"""Append a test entry to (or update an existing entry of) ``Response Repository Matrix.xlsx`` in the ``guili244540/documentation`` GitHub repository.
 
 The GitHub connection follows Scenario 2 of the External API Integration guide (fixed
 service credential): the deployment binds the workspace secret ``githubtoken`` as
@@ -17,7 +17,9 @@ Run shape (deterministic workflow, side effects in activities)::
 
     read_testlog        GET the workbook (bytes + blob sha + existing test IDs)
     [dry-run gate]      return the planned row without writing
-    commit_testlog      edit the workbook with openpyxl, PUT it with the blob sha
+    commit_testlog      edit the workbook with openpyxl (append a new row, or
+                        update an existing Test ID row in place when
+                        ``update_existing`` is set), PUT it with the blob sha
     verify_testlog      GET the file back and confirm the row landed
 """
 
@@ -90,12 +92,21 @@ class NewTestEntry(BaseModel):
 
 
 class UpdateGitHubLogInput(BaseModel):
-    """Input of the ``update-github-log`` workflow."""
+    """Input of the ``update-github-log`` workflow.
+
+    With ``update_existing`` the workflow updates the row of the explicit
+    ``entry.test_id`` in place instead of appending a new row; fields left
+    ``None`` keep the values already stored in that row.
+    """
 
     entry: NewTestEntry
     commit_message: str | None = Field(default=None, max_length=500)
     dry_run: bool = Field(
         default=False, description="Plan the change without committing anything"
+    )
+    update_existing: bool = Field(
+        default=False,
+        description="Update the existing Test ID row in place instead of appending",
     )
 
 
@@ -129,6 +140,7 @@ class CommitTestLogInput(BaseModel):
     entry: NewTestEntry
     test_id: int = Field(ge=1)
     commit_message: str
+    update_existing: bool = False
 
 
 class CommitResult(BaseModel):
@@ -467,7 +479,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
     rate_limit=GITHUB_API_RATE_LIMIT,
 )
 async def commit_testlog(params: CommitTestLogInput) -> CommitResult:
-    """Append the entry to the log sheet and PUT the workbook with the blob sha read earlier."""
+    """Write the entry to the log sheet (append, or update in place) and PUT the workbook."""
     import base64
     import copy
     import io
@@ -488,22 +500,39 @@ async def commit_testlog(params: CommitTestLogInput) -> CommitResult:
         raise workflows.WorkflowError("github_log_file_not_a_workbook", non_retryable=True) from None
 
     id_column = mapping["Test ID"]
-    for row in ws.iter_rows(min_row=cfg["header_row"] + 1, max_row=ws.max_row, max_col=id_column):
-        value = row[-1].value
-        if isinstance(value, (int, float)) and int(value) == params.test_id:
+    if params.update_existing:
+        row_index = None
+        for row in ws.iter_rows(min_row=cfg["header_row"] + 1, max_row=ws.max_row, max_col=id_column):
+            value = row[-1].value
+            if isinstance(value, (int, float)) and int(value) == params.test_id:
+                row_index = row[0].row
+                break
+        if row_index is None:
             raise workflows.WorkflowError(
-                f"test_id_already_exists:{params.test_id}", non_retryable=True
+                f"test_id_not_found:{params.test_id}", non_retryable=True
             )
+        source_row = None
+    else:
+        for row in ws.iter_rows(min_row=cfg["header_row"] + 1, max_row=ws.max_row, max_col=id_column):
+            value = row[-1].value
+            if isinstance(value, (int, float)) and int(value) == params.test_id:
+                raise workflows.WorkflowError(
+                    f"test_id_already_exists:{params.test_id}", non_retryable=True
+                )
+        row_index = _last_data_row(ws, cfg["header_row"]) + 1
+        source_row = row_index - 1
 
     values = _normalise_entry(params.entry, _lists_values(workbook, cfg["lists_sheet"]))
     values["Test ID"] = params.test_id
 
-    row_index = _last_data_row(ws, cfg["header_row"]) + 1
-    source_row = row_index - 1
     for header, value in values.items():
         if header not in mapping:
             continue
+        if params.update_existing and value is None:
+            continue  # not provided: keep the existing cell content
         target = ws.cell(row=row_index, column=mapping[header], value=value)
+        if params.update_existing:
+            continue  # in-place update: keep the existing cell style
         if source_row > cfg["header_row"]:
             src = ws.cell(row=source_row, column=mapping[header])
             target.font = copy.copy(src.font)
@@ -603,7 +632,12 @@ class UpdateGitHubLog:
         entry = data.entry
         question = entry.question.strip()
         test_id = entry.test_id if entry.test_id is not None else state.next_test_id
-        if test_id in state.existing_test_ids:
+        if data.update_existing:
+            if entry.test_id is None:
+                raise ValueError("Updating requires an explicit test_id in the entry")
+            if test_id not in state.existing_test_ids:
+                raise ValueError(f"Test ID {test_id} not found in the log")
+        elif test_id in state.existing_test_ids:
             raise ValueError(f"Test ID {test_id} already exists in the log")
         message = data.commit_message or (
             f"Add test {test_id}: '{question[:80]}' (quality {entry.quality})"
@@ -621,6 +655,7 @@ class UpdateGitHubLog:
                 entry=entry.model_copy(update={"question": question}),
                 test_id=test_id,
                 commit_message=message,
+                update_existing=data.update_existing,
             )
         )
         verify = await verify_testlog(
