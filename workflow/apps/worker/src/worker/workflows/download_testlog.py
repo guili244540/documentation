@@ -9,13 +9,13 @@ secret ``githubtoken`` bound as ``GITHUB_TOKEN``, never in the conversation.
 
 The chat agent that starts the execution decodes ``base64_content`` and publishes it
 as a downloadable artifact server-side; reusing ``read_testlog`` guarantees the
-returned bytes are a workbook the log updater would accept.
+returned bytes are a workbook the log updater would accept. The file name comes from
+the activity too: deterministic workflow code must not read the environment.
 """
 
 from __future__ import annotations
 
 import base64
-import os
 
 import mistralai.workflows as workflows
 from pydantic import BaseModel
@@ -43,9 +43,7 @@ class DownloadTestLog:
         state = await read_testlog(ReadTestLogInput())
         content = base64.b64decode(state.base64_content)
         return DownloadTestLogOutput(
-            file_name=os.path.basename(
-                os.environ.get("GITHUB_LOG_PATH", "Response Repository Matrix.xlsx")
-            ),
+            file_name=state.file_name,
             base64_content=state.base64_content,
             blob_sha=state.blob_sha,
             size_bytes=len(content),
