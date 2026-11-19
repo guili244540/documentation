@@ -131,6 +131,7 @@ class SheetState(BaseModel):
     next_test_id: int
     existing_test_ids: list[int]
     headers: list[str]
+    file_name: str
 
 
 class CommitTestLogInput(BaseModel):
@@ -467,6 +468,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         next_test_id=next_test_id,
         existing_test_ids=existing,
         headers=list(mapping.keys()),
+        file_name=os.path.basename(cfg["path"]),
     )
 
 
