@@ -10,10 +10,11 @@
 
 | File | Change |
 |---|---|
-| `workflow/apps/worker/src/worker/workflows/update_github_log.py` | `_github_config()` also reads `APP_DOWNLOAD_URL` (default `""`). `SheetState` gains `download_url: str = ""`; `read_testlog` fills it from config (env read stays inside the activity — determinism rule). `UpdateGitHubLogOutput` gains `download_url: str = ""`, set in `UpdateGitHubLog.run()` from `state.download_url` (both the dry-run and the committed return paths). |
+| `workflow/apps/worker/src/worker/workflows/update_github_log.py` | `_github_config()` also reads `APP_DOWNLOAD_URL` (default `""` — explicit override only). `SheetState` gains `download_url: str = ""`; `read_testlog` fills it via the URL resolution in §2 (env read and API call stay inside activities — determinism rule). `UpdateGitHubLogOutput` gains `download_url: str = ""`, set in `UpdateGitHubLog.run()` from `state.download_url` (both the dry-run and the committed return paths). |
+| `workflow/apps/worker/src/worker/workflows/update_github_log.py` (new activity) | Add `resolve_download_url`: returns `APP_DOWNLOAD_URL` when set, otherwise queries the platform deployments API for the `<app>-api` deployment and caches the result (details in §2). |
 | `workflow/apps/worker/src/worker/workflows/download_testlog.py` | `DownloadTestLogOutput` gains `download_url: str = ""`, set from `state.download_url`. |
 | `workflow/apps/worker/tests/test_download_testlog.py`, `test_update_github_log.py` | New cases: with `APP_DOWNLOAD_URL` set, both outputs carry it verbatim and it contains no token material; unset → empty string. |
-| `workflow/.env.example` | Add the name-only line `APP_DOWNLOAD_URL=` next to the `GITHUB_LOG_*` block, with a comment that it is bound at deploy time to the `update-github-log-api` module URL. Same declaration style as the existing `GITHUB_LOG_*` vars (the worker reads them via `os.environ`; no new env-package field needed). |
+| `workflow/.env.example` | Add the name-only line `APP_DOWNLOAD_URL=` next to the `GITHUB_LOG_*` block, commented as an **optional override** of the auto-discovered `update-github-log-api` URL (normally left empty). Same declaration style as the existing `GITHUB_LOG_*` vars (the worker reads them via `os.environ`; no new env-package field needed). |
 
 ### 1.2 New `api` module — the endpoint (R1/R2)
 
@@ -44,7 +45,9 @@
 2. **Fetch.** Start a `download-testlog` execution with the same client the platform docs use (`mistralai_capabilities.workflows.client.get_client()`, `deployment_name` from `env.workflows.env.deployment_name`, i.e. `update-github-log-worker`) and await `handle.result()`. This reuses `read_testlog`, so the GitHub read stays under `GITHUB_API_RATE_LIMIT` (C5) and there is a single read code path. Decode `base64_content` **once**, server-side, here.
 3. **Respond.** `200` with body = raw xlsx bytes, `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `Content-Disposition: attachment; filename="<result.file_name>"` (the activity already derives the file name from `GITHUB_LOG_PATH`). **Audit-log** (structlog) caller + `blob_sha` + `size_bytes` + timestamp. Errors map to the SPEC's contract table (401/403/200/503/502).
 
-**Worker outputs (R7):** `APP_DOWNLOAD_URL` is read inside `read_testlog` (activity) and returned as `download_url` on `SheetState` → both workflow outputs. Empty when unset → chat falls back to artifact-only.
+**Worker outputs (R7):** `download_url` is resolved inside the activities and returned on `SheetState` → both workflow outputs. Empty on failure → chat falls back to artifact-only.
+
+**Download-URL resolution (R7).** `download_url` = `APP_DOWNLOAD_URL` when set (explicit override), otherwise auto-discovered: the `resolve_download_url` activity calls `GET {workflows_base_url}/v1/workflows/deployments/<app>-api` — deployment names are `<app>-<module>` per the deploy docs, app name from `mistral.json` (`update-github-log` → `update-github-log-api`) — authenticated with the worker's platform token (`mistral_app_token()`, mounted via `MISTRAL_SA_TOKEN_PATH`), extracts the api module's ingress URL from the response, and caches it in-process (the URL is stable per app; re-query on miss or error). Any failure → `""`. This is a Mistral API call, so it stays out of `GITHUB_API_RATE_LIMIT`; cache it to keep volume at ~1 call per worker lifetime. The vendored docs only show the deployments `PATCH`, so verify the exact URL field of the `GET` response once against the live API at implementation time.
 
 **Determinism rules preserved:** no env reads or side effects in workflow bodies; the api handler is not workflow code, so reading env there is allowed, but the URL still travels through the activity so the outputs stay self-describing.
 
@@ -53,7 +56,7 @@
 1. Worker `download_url` plumbing + tests (no deploy needed; pure additive field).
 2. `api` module: `mistral.json` entry, `apps/api` package + `project.json`, `Dockerfile.api`, tests.
 3. `.env.example` + `README.md`.
-4. Deploy (see §4). Note the bootstrap order: the concrete URL only exists after the `api` module is deployed once, so `APP_DOWNLOAD_URL` is bound in a **second** deploy pass (see §4).
+4. Deploy (see §4). No manual URL binding is needed: once the `api` module is deployed, the worker auto-discovers the `update-github-log-api` URL (see §2, download-URL resolution); `APP_DOWNLOAD_URL` is only an optional override.
 
 ## 4. Build, deploy, verify
 
@@ -61,7 +64,7 @@
 - Lint: semgrep per the NX `project.json` targets (`apps/worker` and `apps/api`).
 - Local smoke: `mistral apps dev --filter api` (and `--filter worker`) from `workflow/`; `curl` the dev URL without/with a caller credential → expect 401 then 200.
 - Deploy: push, then `mistral apps deploy` from `workflow/` (builds from the pushed commit; the worker deploys as `update-github-log-worker`, the api module as `update-github-log-api`). Bind `GITHUB_TOKEN` from the workspace secret `githubtoken` on the worker deployment via `PATCH /v1/workflows/deployments/update-github-log-worker` (pattern in `.agents/skills/capability-workflows/references/guides/managed-deployments.mdx`); the api module needs `GITHUB_LOG_*` only if it reads GitHub directly (it does not in the preferred path) — it needs `APP_DOWNLOAD_ALLOWLIST` if used.
-- Read the `update-github-log-api` URL from the deploy output / Console, then bind `APP_DOWNLOAD_URL=<that url>/download` on the **worker** deployment and re-deploy the worker so `download_url` appears in workflow outputs.
+- After deploy, confirm in a `download-testlog` result (or the worker logs) that `download_url` resolves to the `update-github-log-api` URL shown in the deploy output / Console; bind `APP_DOWNLOAD_URL` only to pin an explicit override.
 - Manual checks: `curl` the endpoint without a token → 401; with an unauthorized caller → 403; with an authorized caller → 200, correct headers, bytes open as a valid workbook; audit log line present; Studio skill shows the link after an update.
 - Update the chat skill prompt with the URL (out of repo).
 
