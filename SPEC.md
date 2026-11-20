@@ -45,6 +45,7 @@
 - **Consistency:** "who can start a `download-testlog` execution" is already the authorization boundary of the chat path; the API module applies the same check at the ingress.
 - **Load:** at ≤ ~90 GitHub calls/day the existing 30/s activity rate limit and GitHub's 5,000 req/h quota are irrelevant; the rate limit stays as protection against bursts, not as a bottleneck (see R4).
 - **Discoverability (R7):** users learn the `<app-url>/download` link from the chat itself — after each update or when they ask — and from the README, instead of having to track down the deployment URL.
+- **No base64 on the user-facing hop:** `GET /download` returns the raw workbook bytes as the HTTP response body, so the user never has to decode base64 out of a JSON workflow result (unlike the chat-artifact path today). Base64 remains only where it is inherent: GitHub's contents API returns base64 inline (≤ 1 MB), and when the handler fetches via a `download-testlog` execution the bytes still ride as `base64_content` inside the workflow result — decoded once server-side before streaming.
 
 ## 5. Expected behaviour
 
