@@ -2,7 +2,7 @@
 
 - **Status:** draft
 - **Branch:** `directDownload`
-- **Scope:** let an authenticated user download the current test-log workbook directly from the deployed app, without going through a chat agent.
+- **Scope:** let an authenticated user download the current test-log workbook directly from the deployed app (`GET /download`), without going through a chat agent — and let the chat surface that link after each update and on request (R7).
 
 ## 1. Requirements
 
@@ -12,6 +12,7 @@
 - **R4.** Expected load is small: at most 2–3 concurrent users, at most 10 file updates per user per day (≈90 GitHub calls/day). Neither the platform rate limit nor GitHub's quota may become a bottleneck.
 - **R5.** Existing behaviour must keep working unchanged: `update-github-log` and the chat-based `download-testlog` artifact path.
 - **R6.** The worker stays a pure workflow worker: no HTTP listener inside the worker process.
+- **R7.** The chat also surfaces the direct-download link: after each successful `update-github-log` run, and whenever the user asks for the workbook, the chat reply includes the `<app-url>/download` link (a button where the UI supports it), while still publishing the artifact as a fallback.
 
 ## 2. Current state
 
@@ -31,9 +32,11 @@
    1. **Authenticates the caller** using the per-request caller credentials the platform installs (`caller_credentials()` / `install_caller_credentials()` in `workflow/packages/py/utils/src/utils/mistral.py:41-66`). No caller credential → `401`. Caller not authorized → `403`. Authorization = the caller is allowed to execute `download-testlog` on this deployment (same notion of "who may fetch the log" the chat path uses); optionally narrowed by an allowlist.
    2. **Fetches the workbook** by starting a `download-testlog` workflow execution and awaiting its result — this reuses the exact read path (`read_testlog` activity), keeps the GitHub read under `GITHUB_API_RATE_LIMIT`, and keeps one code path that owns "how the workbook is read". (Fallback if executions prove awkward: call the GitHub contents API directly with `GITHUB_TOKEN`, like `read_testlog` does, plus an in-handler throttle and a blob-sha-keyed cache.)
    3. **Responds as a file download**: `200`, `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `Content-Disposition: attachment; filename="<basename of GITHUB_LOG_PATH>"`, body = the decoded bytes. Writes an audit log line: caller, blob sha, size, timestamp.
-3. **Tests** in `workflow/apps/api/tests/`, same style as `workflow/apps/worker/tests/`: mocked GitHub API / mocked workflow execution plus a fake caller-credential provider. Cases: 401 without credentials, 403 for an unauthorized caller, 200 with correct headers/bytes/audit for an authorized caller, and a test asserting no token material appears in any response or log.
-4. **README** (`README.md`): a short section documenting the endpoint, the auth model, and the user flow (browser URL and `curl`).
-5. **`.env.example`**: document any new variable (expected: none beyond the existing `GITHUB_LOG_*` and `GITHUB_TOKEN`).
+3. **Expose the download URL in the worker outputs.** New env var `APP_DOWNLOAD_URL` (declared in `.env.example`, bound at deploy time to the deployed API module's URL — the `update-github-log-api` deployment URL printed by `mistral apps deploy` and shown in the Console). It is read **inside the `read_testlog` activity**, like the file name today (determinism rule: no env reads in workflow bodies), added as `download_url` to `SheetState`, and surfaced on both `DownloadTestLogOutput` and `UpdateGitHubLogOutput`. Empty when unset → the chat keeps today's artifact-only behavior.
+4. **Chat agent instructions / UI (R7).** After a successful `update-github-log`, the chat reply includes the `download_url` link; when the user asks for the workbook, the agent runs `download-testlog` and replies with the same link. Where the conversational UI supports it, render a `ButtonLink(href=download_url)` (`workflow/.agents/skills/capability-workflows/references/guides/assist-workflows-output.mdx`, component table) instead of a bare URL. Artifact publication stays as the fallback.
+5. **Tests** in `workflow/apps/api/tests/`, same style as `workflow/apps/worker/tests/`: mocked GitHub API / mocked workflow execution plus a fake caller-credential provider. Cases: 401 without credentials, 403 for an unauthorized caller, 200 with correct headers/bytes/audit for an authorized caller, and a test asserting no token material appears in any response or log. Worker tests extended for `download_url`: present and token-free when `APP_DOWNLOAD_URL` is set, empty when unset, in both `download-testlog` and `update-github-log` outputs.
+6. **README** (`README.md`): a short section documenting the endpoint, the auth model, the user flow (browser URL and `curl`), the deployed module URL (`update-github-log-api`, from the Console / deploy output), and that the chat shows the link after each update and on request.
+7. **`.env.example`**: document `APP_DOWNLOAD_URL` alongside the existing `GITHUB_LOG_*` and `GITHUB_TOKEN`.
 
 ## 4. Why
 
@@ -41,6 +44,7 @@
 - **Security:** the repo is private and the only credential is the worker's service token. Any direct endpoint must therefore authenticate callers itself; an open or link-based endpoint would hand the private workbook to anyone. The platform's caller credentials provide per-request identity without inventing a new shared secret, and the token never leaves the deployment.
 - **Consistency:** "who can start a `download-testlog` execution" is already the authorization boundary of the chat path; the API module applies the same check at the ingress.
 - **Load:** at ≤ ~90 GitHub calls/day the existing 30/s activity rate limit and GitHub's 5,000 req/h quota are irrelevant; the rate limit stays as protection against bursts, not as a bottleneck (see R4).
+- **Discoverability (R7):** users learn the `<app-url>/download` link from the chat itself — after each update or when they ask — and from the README, instead of having to track down the deployment URL.
 
 ## 5. Expected behaviour
 
@@ -51,6 +55,7 @@
 - The browser/curl receives the current workbook as a file download — no chat, no GitHub access needed by the user.
 - Not signed in → `401`, no body. Signed in but not authorized → `403`, no body.
 - Every successful download is audit-logged (caller, blob sha, size, timestamp).
+- In chat (R7): after each successful `update-github-log`, the reply shows a clickable link to `<app-url>/download`; when the user asks for the workbook, the chat replies with the same link and still offers the artifact.
 
 ### API contract
 
@@ -77,6 +82,7 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 - **C7 — Dependencies.** No new dependencies beyond what the app already uses (httpx, openpyxl, pydantic) and what the platform provides.
 - **C8 — Backward compatibility.** `update-github-log` and `download-testlog` behave exactly as before; the chat artifact path remains available (R5).
 - **C9 — Style.** Match `apps/worker`: pydantic input/output models, the `WorkflowError` taxonomy, tests against a mocked GitHub API, semgrep lint per `apps/*/project.json`.
+- **C10 — The link is not a capability.** `download_url` carries no token or secret; access stays gated by caller authentication at the platform ingress, so a leaked link alone yields 401. Like the file name, the URL is worker configuration read inside an activity, never workflow input.
 
 ## 7. Acceptance criteria
 
@@ -90,6 +96,8 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 - **AC8.** `README.md` documents the endpoint, auth model, and user flow.
 - **AC9.** The diff contains no public-exposure mechanism (no tunnel/proxy config, no listener bound to all interfaces, no unsigned-URL access) — C1 holds by construction.
 - **AC10.** Existing worker tests are unchanged and green (C8).
+- **AC11.** With `APP_DOWNLOAD_URL` set, `download-testlog` and `update-github-log` outputs contain `download_url` equal to it; unset → the field is empty. The value never contains `GITHUB_TOKEN` or any secret material (tested) — C10.
+- **AC12.** The chat reply after an `update-github-log` run and on a download request includes the link (agent instructions / `ButtonLink`); the README documents the chat link and the deployed module URL (extends AC8).
 
 ## 8. Out of scope
 
@@ -109,3 +117,4 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 - Route path `GET /download`; module name `api`; app directory `workflow/apps/api`; image `deploy/docker/Dockerfile.api`.
 - Authorization = platform-authenticated caller allowed to execute `download-testlog` (optionally narrowed by an allowlist later).
 - Fetch path = start a `download-testlog` execution and await its result (keeps the rate-limited read path); direct GitHub GET kept as documented fallback under C5/C6.
+- Chat link (R7): new config var `APP_DOWNLOAD_URL` bound at deploy time to the `update-github-log-api` module URL; shown as a `ButtonLink` where the UI supports it, as a raw link otherwise; the artifact stays as fallback.
