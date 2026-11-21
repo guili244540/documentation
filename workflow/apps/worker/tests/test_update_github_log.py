@@ -12,6 +12,7 @@ import base64
 import io
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import httpx
 import openpyxl
@@ -115,6 +116,38 @@ class FakeGitHub:
 def install_fake_github(monkeypatch: pytest.MonkeyPatch, fake: FakeGitHub) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setattr(update_github_log, "_github_async_client", fake.client_factory)
+
+
+class FakeFilesAPI:
+    """Serves the Mistral Files API from memory: uploads return sequential file ids."""
+
+    def __init__(self, fail: bool = False) -> None:
+        self.uploads: list[dict] = []
+        self.deleted: list[str] = []
+        self.fail = fail
+
+    def client(self) -> SimpleNamespace:
+        api = self
+
+        class _Files:
+            async def upload_async(self, *, file, purpose=None, visibility=None, expiry=None):
+                if api.fail:
+                    raise RuntimeError("files api unavailable")
+                api.uploads.append(
+                    {"file": file, "purpose": purpose, "visibility": visibility, "expiry": expiry}
+                )
+                return SimpleNamespace(id=f"file-{len(api.uploads)}")
+
+            async def delete_async(self, *, file_id) -> None:
+                api.deleted.append(file_id)
+
+        return SimpleNamespace(files=_Files())
+
+
+def install_fake_files(monkeypatch: pytest.MonkeyPatch, fake: FakeFilesAPI) -> None:
+    monkeypatch.setattr(update_github_log, "_files_client", lambda: fake.client())
+    monkeypatch.setattr(update_github_log, "_file_id_cache", {})
+    monkeypatch.setattr(update_github_log, "_last_published_file_id", None)
 
 
 async def start_and_run(temporal_env, input: dict) -> dict:
@@ -345,3 +378,21 @@ async def test_update_requires_existing_explicit_test_id(
         )
 
     assert fake.put_payloads == []
+
+
+async def test_committed_output_carries_file_id(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+
+    result = await start_and_run(temporal_env, {"entry": {"question": "New?", "quality": 5}})
+
+    assert result["verified"] is True
+    # The output points at the post-commit blob: the read published file-1, the verify published file-2.
+    assert result["file_id"] == "file-2"
+    assert "test-token" not in result["file_id"]
+    assert len(files.uploads) == 2
+    assert files.deleted == ["file-1"]

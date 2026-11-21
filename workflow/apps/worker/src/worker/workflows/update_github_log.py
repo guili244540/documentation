@@ -63,6 +63,12 @@ GITHUB_API_RATE_LIMIT = workflows.RateLimit(
     time_window_in_sec=1, max_execution=30, key="github-api"
 )
 
+#: Media type of the log workbook, sent as the Files API upload's content type.
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+#: Uploaded workbooks expire after a week unless superseded earlier (the Files API takes hours).
+FILES_UPLOAD_EXPIRY_HOURS = 24 * 7
+
 
 class NewTestEntry(BaseModel):
     """One row to append to the log.
@@ -118,6 +124,7 @@ class UpdateGitHubLogOutput(BaseModel):
     commit_url: str | None = None
     file_url: str | None = None
     verified: bool | None = None
+    file_id: str = ""
 
 
 class ReadTestLogInput(BaseModel):
@@ -132,6 +139,7 @@ class SheetState(BaseModel):
     existing_test_ids: list[int]
     headers: list[str]
     file_name: str
+    file_id: str = ""
 
 
 class CommitTestLogInput(BaseModel):
@@ -161,6 +169,7 @@ class VerifyTestLogInput(BaseModel):
 class VerifyResult(BaseModel):
     verified: bool
     detail: str
+    file_id: str = ""
 
 
 def _github_config() -> dict[str, object]:
@@ -407,6 +416,88 @@ def _last_data_row(ws: object, header_row: int) -> int:
     return last
 
 
+class PublishTestLogFileInput(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+    base64_content: str
+    blob_sha: str
+    file_name: str
+
+
+#: blob sha -> Files API file_id, so an unchanged workbook is not re-uploaded (per worker process).
+_file_id_cache: dict[str, str] = {}
+#: The currently published upload, so a changed blob supersedes (deletes) it.
+_last_published_file_id: str | None = None
+
+
+def _files_client() -> object:
+    """The Mistral client for Files API calls, acting as the app itself. Tests monkeypatch this seam."""
+    from utils.mistral import mistral_client
+
+    return mistral_client()
+
+
+@workflows.activity(
+    name="publish-testlog-file",
+    start_to_close_timeout=timedelta(seconds=60),
+    retry_policy_max_attempts=3,
+    retry_policy_backoff_coefficient=2.0,
+)
+async def publish_testlog_file(params: PublishTestLogFileInput) -> str:
+    """Upload the workbook to the Mistral Files API and return its ``file_id`` (``""`` on failure).
+
+    The upload runs as the app itself (the worker's service-account token) with workspace
+    visibility, so any workspace member can download the file with their own token from
+    ``/v1/files/{file_id}/content``; ``file_id`` alone is not a capability. Results are
+    cached by blob sha — an unchanged file is not re-uploaded — and when the blob changes
+    the superseded upload is deleted best-effort. A Mistral API call, so it stays out of
+    ``GITHUB_API_RATE_LIMIT``. Any failure resolves to ``""`` so the inline artifact path
+    keeps working; the token never appears in the result or the logs.
+    """
+    import base64
+    import structlog
+
+    logger = structlog.get_logger("workflows.publish_testlog_file")
+    cached = _file_id_cache.get(params.blob_sha)
+    if cached:
+        return cached
+    try:
+        client = _files_client()
+        content = base64.b64decode(params.base64_content)
+        upload = await client.files.upload_async(
+            file={
+                "file_name": params.file_name,
+                "content": content,
+                "content_type": XLSX_MEDIA_TYPE,
+            },
+            purpose="ocr",
+            visibility="workspace",
+            expiry=FILES_UPLOAD_EXPIRY_HOURS,
+        )
+        file_id = str(upload.id)
+        global _last_published_file_id
+        previous = _last_published_file_id
+        if previous and previous != file_id:
+            try:
+                await client.files.delete_async(file_id=previous)
+            except Exception:
+                logger.warning(
+                    "publish_testlog_file: could not delete the superseded upload",
+                    superseded_file_id=previous,
+                )
+        _file_id_cache[params.blob_sha] = file_id
+        _last_published_file_id = file_id
+        logger.info(
+            "publish_testlog_file: uploaded",
+            file_id=file_id,
+            blob_sha=params.blob_sha,
+            size_bytes=len(content),
+        )
+        return file_id
+    except Exception as error:
+        logger.warning("publish_testlog_file: upload failed", error=type(error).__name__)
+        return ""
+
+
 @workflows.activity(
     name="github-read-testlog",
     start_to_close_timeout=timedelta(seconds=30),
@@ -462,6 +553,13 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         if isinstance(value, (int, float)):
             existing.append(int(value))
     next_test_id = max(existing, default=0) + 1
+    file_id = await publish_testlog_file(
+        PublishTestLogFileInput(
+            base64_content=content_b64,
+            blob_sha=blob_sha,
+            file_name=os.path.basename(cfg["path"]),
+        )
+    )
     return SheetState(
         base64_content=content_b64,
         blob_sha=blob_sha,
@@ -469,6 +567,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         existing_test_ids=existing,
         headers=list(mapping.keys()),
         file_name=os.path.basename(cfg["path"]),
+        file_id=file_id,
     )
 
 
@@ -614,6 +713,15 @@ async def verify_testlog(params: VerifyTestLogInput) -> VerifyResult:
     except (KeyError, ValueError, TypeError, OSError):
         raise workflows.WorkflowError("github_unexpected_response", non_retryable=True) from None
 
+    # Publish the post-commit blob, so an update's output points at the workbook as committed.
+    file_id = await publish_testlog_file(
+        PublishTestLogFileInput(
+            base64_content=body["content"],
+            blob_sha=str(body.get("sha") or ""),
+            file_name=os.path.basename(cfg["path"]),
+        )
+    )
+
     id_column = mapping["Test ID"]
     question_column = mapping["Question received"]
     for row in ws.iter_rows(min_row=cfg["header_row"] + 1, max_row=ws.max_row):
@@ -621,9 +729,9 @@ async def verify_testlog(params: VerifyTestLogInput) -> VerifyResult:
         if isinstance(test_id, (int, float)) and int(test_id) == params.test_id:
             question = row[question_column - 1].value if len(row) >= question_column else None
             if question == params.question:
-                return VerifyResult(verified=True, detail="row found with matching question")
-            return VerifyResult(verified=False, detail="row found but question differs")
-    return VerifyResult(verified=False, detail="row not found in file after commit")
+                return VerifyResult(verified=True, detail="row found with matching question", file_id=file_id)
+            return VerifyResult(verified=False, detail="row found but question differs", file_id=file_id)
+    return VerifyResult(verified=False, detail="row not found in file after commit", file_id=file_id)
 
 
 @workflows.workflow.define(name="update-github-log")
@@ -649,6 +757,7 @@ class UpdateGitHubLog:
                 dry_run=True,
                 test_id=test_id,
                 message=f"DRY RUN — would commit: {message}",
+                file_id=state.file_id,
             )
         commit = await commit_testlog(
             CommitTestLogInput(
@@ -677,4 +786,5 @@ class UpdateGitHubLog:
             commit_url=commit.commit_url,
             file_url=commit.file_url,
             verified=True,
+            file_id=verify.file_id or state.file_id,
         )

@@ -2,7 +2,7 @@
 
 - **Implements:** `SPEC.md` (same branch, `directDownload`)
 - **Branch:** `directDownload`
-- **Status:** the only remaining work is the **Files API approach** (§3) — not started. The two supported approaches are inline (works today, untouched) and the Files API (`SPEC.md` §3). The phase-1 `api` module (`d31798a`…`b10547f`) has been **removed in this revision** after the live findings in `SPEC.md` §11.
+- **Status:** the **Files API approach** (§3) is **implemented on this branch**. The two supported approaches are inline (works today, untouched) and the Files API (`SPEC.md` §3). The phase-1 `api` module (`d31798a`…`b10547f`) was **removed** after the live findings in `SPEC.md` §11.
 - **Approach in one line:** a new `publish-testlog-file` activity uploads the workbook to the Mistral Files API with the worker's service-account token and returns the `file_id` on both workflow outputs; callers download with one authenticated call (`client.files.download(file_id)` / `GET /v1/files/<file_id>/content` with their own bearer token). The inline `base64_content` artifact path stays exactly as it is.
 
 ## 1. Current state
@@ -16,7 +16,7 @@
 
 `git rm` of `workflow/apps/api/`, `workflow/deploy/docker/Dockerfile.api`, `workflow/apps/worker/tests/test_resolve_download_url.py`; the `api` module entry removed from `workflow/mistral.json`; the worker files (`update_github_log.py`, `download_testlog.py`, both workflow test files) reverted to `origin/main` (the `resolve-download-url` activity, `download_url`/`download_url_detail` fields and tests were the only branch changes there); `APP_DOWNLOAD_URL`/`APP_DOWNLOAD_ALLOWLIST` removed from `workflow/.env.example`; the `GET /download` section removed from `README.md`. The root `pyproject.toml` keeps the shared pytest asyncio options (generic test infra, not direct-download code).
 
-## 3. File-by-file changes (Files API approach — not started)
+## 3. File-by-file changes (Files API approach — implemented)
 
 | File | Change |
 |---|---|
@@ -36,11 +36,11 @@ No changes to `mistral.json`, no new module, no new env vars, no Dockerfile chan
 - **Failure semantics:** any upload error → `file_id = ""` and a warning log line (never the token); the inline artifact path keeps working (R5/C8).
 - **Security:** `file_id` is not a capability — download requires the caller's own token at `/v1/files/{id}/content` (C10/R2). No signed URLs. `GITHUB_TOKEN` untouched (C2).
 
-## 5. Order of work (when started)
+## 5. Order of work (done on this branch)
 
-1. `publish-testlog-file` activity + `file_id` on `SheetState`/both outputs + tests (no deploy needed; additive optional field).
-2. README field-name/command check.
-3. Deploy (`mistral apps deploy` from `workflow/`) and verify end-to-end: run `download-testlog`, take `file_id`, download with a workspace token, compare sha; confirm 401 without a token.
+1. `publish-testlog-file` activity + `file_id` on `SheetState`/both outputs + tests — done (direct activity tests plus workflow-level cases; `verify_testlog` also publishes the post-commit blob so an update's `file_id` is current).
+2. README field-name/command check — done.
+3. Deploy (`mistral apps deploy` from `workflow/`) and verify end-to-end: run `download-testlog`, take `file_id`, download with a workspace token, compare sha; confirm 401 without a token — remaining manual step.
 
 ## 6. Build, deploy, verify
 

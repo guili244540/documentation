@@ -1,6 +1,6 @@
 # SPEC — Getting `Response Repository Matrix.xlsx` out of the worker
 
-- **Status:** revised 2026-11-21 — exactly two approaches are supported (see §3): **inline** (works today, unchanged) and the **Mistral Files API** (to implement). An ingress-served `api` module was implemented on this branch earlier and has been removed again after live findings (§11).
+- **Status:** revised and implemented 2026-11-21 — exactly two approaches are supported (see §3): **inline** (works today, unchanged) and the **Mistral Files API** (implemented on this branch). An ingress-served `api` module was implemented on this branch earlier and has been removed again after live findings (§11).
 - **Branch:** `directDownload`
 - **Scope:** let an authenticated user download the current test-log workbook without going through a chat agent, and without anyone needing GitHub access of their own — while the existing chat artifact path keeps working unchanged.
 
@@ -29,7 +29,7 @@
    - SDK: `client.files.download(file_id)` (hits `GET /v1/files/{file_id}/content`, requires the caller's bearer token);
    - or raw HTTP with the caller's token in the `Authorization` header, saving the body as `Response Repository Matrix.xlsx`.
 
-### What needs to change (approach 2 only)
+### What changed (approach 2, implemented on this branch)
 
 1. **`workflow/apps/worker/src/worker/workflows/update_github_log.py`** — new activity `publish-testlog-file` (details in `IMPLEMENTATION_PLAN.md` §3): uploads the workbook bytes with the worker's service-account client (`client.files.upload`, `visibility="workspace"`, an `expiry`, purpose verified against the live API), caches by blob sha so an unchanged file is not re-uploaded, and deletes the superseded upload when the blob changes. Runs inside the activity only (determinism rule: no env reads or side effects in workflow bodies); it is a Mistral API call, so it stays out of `GITHUB_API_RATE_LIMIT`.
 2. **`SheetState` gains `file_id: str = ""`**, filled by `read_testlog`; both `DownloadTestLogOutput` and `UpdateGitHubLogOutput` gain `file_id: str = ""` (empty when the upload fails → callers fall back to the inline artifact). No new env vars, no `mistral.json` change, no new module.

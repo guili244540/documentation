@@ -9,7 +9,10 @@ secret ``githubtoken`` bound as ``GITHUB_TOKEN``, never in the conversation.
 
 The chat agent that starts the execution decodes ``base64_content`` and publishes it
 as a downloadable artifact server-side; reusing ``read_testlog`` guarantees the
-returned bytes are a workbook the log updater would accept. The file name comes from
+returned bytes are a workbook the log updater would accept. The same read also
+publishes the workbook to the Mistral Files API and returns its ``file_id``, so a
+caller with a workspace token can download it directly via
+``/v1/files/{file_id}/content`` without the chat. The file name comes from
 the activity too: deterministic workflow code must not read the environment.
 """
 
@@ -34,6 +37,7 @@ class DownloadTestLogOutput(BaseModel):
     size_bytes: int
     next_test_id: int
     existing_test_ids: list[int]
+    file_id: str = ""
 
 
 @workflows.workflow.define(name="download-testlog")
@@ -49,4 +53,5 @@ class DownloadTestLog:
             size_bytes=len(content),
             next_test_id=state.next_test_id,
             existing_test_ids=state.existing_test_ids,
+            file_id=state.file_id,
         )
