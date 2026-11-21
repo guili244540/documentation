@@ -75,9 +75,11 @@ async def test_override_wins_without_any_http(api_env, monkeypatch: pytest.Monke
     fake.install(monkeypatch)
     monkeypatch.setenv("APP_DOWNLOAD_URL", "https://override.example/download")
 
-    url = await resolve_download_url(ResolveDownloadUrlInput())
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
 
-    assert url == "https://override.example/download"
+    assert resolution.url == "https://override.example/download"
+    assert resolution.source == "override"
+    assert "APP_DOWNLOAD_URL" in resolution.detail
     assert fake.requests == []
 
 
@@ -88,9 +90,11 @@ async def test_found_by_deployment_name(api_env, monkeypatch: pytest.MonkeyPatch
     )
     fake.install(monkeypatch)
 
-    url = await resolve_download_url(ResolveDownloadUrlInput())
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
 
-    assert url == "https://ingress.example/download"
+    assert resolution.url == "https://ingress.example/download"
+    assert resolution.source == "deployment-name"
+    assert "update-github-log-api" in resolution.detail
     assert fake.requests == ["/v1/workflows/deployments/update-github-log-api"]
 
 
@@ -112,9 +116,11 @@ async def test_guessed_from_the_deployments_list_when_name_lookup_misses(
     fake.install(monkeypatch)
     monkeypatch.setattr(app_env, "app_name", "some-other-name")
 
-    url = await resolve_download_url(ResolveDownloadUrlInput())
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
 
-    assert url == "https://ingress.example/download"
+    assert resolution.url == "https://ingress.example/download"
+    assert resolution.source == "deployments-list"
+    assert "chose 'update-github-log-api'" in resolution.detail
     assert "/v1/workflows/deployments" in fake.requests
 
 
@@ -135,9 +141,11 @@ async def test_several_api_deployments_pick_deterministically(
     )
     fake.install(monkeypatch)
 
-    url = await resolve_download_url(ResolveDownloadUrlInput())
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
 
-    assert url == "https://alpha.example/download"
+    assert resolution.url == "https://alpha.example/download"
+    assert resolution.source == "deployments-list"
+    assert "chose 'alpha-api'" in resolution.detail
 
 
 async def test_no_api_deployment_means_empty(api_env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -147,7 +155,11 @@ async def test_no_api_deployment_means_empty(api_env, monkeypatch: pytest.Monkey
     )
     fake.install(monkeypatch)
 
-    assert await resolve_download_url(ResolveDownloadUrlInput()) == ""
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
+
+    assert resolution.url == ""
+    assert resolution.source == "unresolved"
+    assert "none named *-api" in resolution.detail
 
 
 async def test_non_https_endpoint_is_ignored(api_env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -158,7 +170,10 @@ async def test_non_https_endpoint_is_ignored(api_env, monkeypatch: pytest.Monkey
     )
     fake.install(monkeypatch)
 
-    assert await resolve_download_url(ResolveDownloadUrlInput()) == ""
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
+
+    assert resolution.url == ""
+    assert "http://insecure.example" not in resolution.detail
 
 
 async def test_missing_app_credential_means_empty(api_env, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -170,7 +185,10 @@ async def test_missing_app_credential_means_empty(api_env, monkeypatch: pytest.M
 
     monkeypatch.setattr(utils.mistral, "mistral_app_token", no_token)
 
-    assert await resolve_download_url(ResolveDownloadUrlInput()) == ""
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
+
+    assert resolution.url == ""
+    assert "MistralNotConfiguredError" in resolution.detail
     assert fake.requests == []
 
 
@@ -184,5 +202,6 @@ async def test_result_is_cached(api_env, monkeypatch: pytest.MonkeyPatch) -> Non
     first = await resolve_download_url(ResolveDownloadUrlInput())
     second = await resolve_download_url(ResolveDownloadUrlInput())
 
-    assert first == second == "https://ingress.example/download"
+    assert first.url == second.url == "https://ingress.example/download"
+    assert first.source == second.source == "deployment-name"
     assert fake.requests == ["/v1/workflows/deployments/update-github-log-api"]

@@ -37,6 +37,7 @@ class DownloadTestLogOutput(BaseModel):
     next_test_id: int
     existing_test_ids: list[int]
     download_url: str = ""
+    download_url_detail: str = ""
 
 
 @workflows.workflow.define(name="download-testlog")
@@ -53,4 +54,5 @@ class DownloadTestLog:
             next_test_id=state.next_test_id,
             existing_test_ids=state.existing_test_ids,
             download_url=state.download_url,
+            download_url_detail=state.download_url_detail,
         )

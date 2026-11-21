@@ -91,8 +91,10 @@ async def test_download_output_carries_download_url_when_configured(
     result = await start_and_run(temporal_env, {})
 
     assert result["download_url"] == DOWNLOAD_URL
+    assert result["download_url_detail"].startswith("override")
     # The link carries no credential: the GitHub token of the test env must not appear in it.
     assert "test-token" not in result["download_url"]
+    assert "test-token" not in result["download_url_detail"]
 
 
 async def test_download_output_has_empty_download_url_when_unset(
@@ -107,3 +109,4 @@ async def test_download_output_has_empty_download_url_when_unset(
     result = await start_and_run(temporal_env, {})
 
     assert result["download_url"] == ""
+    assert result["download_url_detail"].startswith("unresolved")

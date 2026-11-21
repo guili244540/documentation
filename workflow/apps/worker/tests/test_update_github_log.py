@@ -362,7 +362,9 @@ async def test_dry_run_output_carries_download_url(
     )
 
     assert result["download_url"] == DOWNLOAD_URL
+    assert result["download_url_detail"].startswith("override")
     assert "test-token" not in result["download_url"]
+    assert "test-token" not in result["download_url_detail"]
 
 
 async def test_committed_output_carries_download_url(
@@ -376,6 +378,7 @@ async def test_committed_output_carries_download_url(
 
     assert result["verified"] is True
     assert result["download_url"] == DOWNLOAD_URL
+    assert result["download_url_detail"].startswith("override")
     assert "test-token" not in result["download_url"]
 
 
@@ -392,3 +395,4 @@ async def test_output_has_empty_download_url_when_unset(
     )
 
     assert result["download_url"] == ""
+    assert result["download_url_detail"].startswith("unresolved")

@@ -119,6 +119,7 @@ class UpdateGitHubLogOutput(BaseModel):
     file_url: str | None = None
     verified: bool | None = None
     download_url: str = ""
+    download_url_detail: str = ""
 
 
 class ReadTestLogInput(BaseModel):
@@ -134,6 +135,7 @@ class SheetState(BaseModel):
     headers: list[str]
     file_name: str
     download_url: str = ""
+    download_url_detail: str = ""
 
 
 class CommitTestLogInput(BaseModel):
@@ -413,9 +415,28 @@ class ResolveDownloadUrlInput(BaseModel):
     """``resolve_download_url`` takes no business input; its configuration is worker env."""
 
 
+class DownloadUrlResolution(BaseModel):
+    """How ``download_url`` was resolved: the URL plus a short, secret-free explanation.
+
+    ``source`` is one of ``override`` (``APP_DOWNLOAD_URL``), ``deployment-name`` (the
+    ``<APP_NAME>-api`` lookup hit), ``deployments-list`` (guessed from the active
+    deployments), or ``unresolved``. ``detail`` records the steps and their outcome
+    (requested paths, deployment names, HTTP statuses, error class) — never a token.
+    """
+
+    model_config = ConfigDict(hide_input_in_errors=True)
+    url: str = ""
+    source: str = "unresolved"
+    detail: str = ""
+
+    @property
+    def explanation(self) -> str:
+        return f"{self.source}: {self.detail}" if self.detail else self.source
+
+
 #: The ``api`` module's URL is stable for the life of the app, so it is looked up once per
 #: worker process. A Mistral API call, so it stays out of ``GITHUB_API_RATE_LIMIT``.
-_api_module_url_cache: str | None = None
+_api_module_url_cache: DownloadUrlResolution | None = None
 
 
 def _deployment_endpoint(body: object) -> str:
@@ -432,14 +453,14 @@ def _deployment_endpoint(body: object) -> str:
     return endpoint if isinstance(endpoint, str) and endpoint.startswith("https://") else ""
 
 
-async def _discover_api_module_url() -> str:
-    """Guess the deployed ``api`` module's download URL, or ``""`` when nothing matches.
+async def _discover_api_module_url() -> DownloadUrlResolution:
+    """Guess the deployed ``api`` module's download URL, recording how far each step got.
 
     Looks up ``<APP_NAME>-api`` by name first; when that misses (the app name is not what
     the deployment is named, or the module is not deployed yet), lists the active
     deployments and takes the one named ``*-api`` that exposes an https endpoint,
-    preferring ``<APP_NAME>-api``. The result carries the ``/download`` path; it holds no
-    credential, so a leaked link alone still gets 401 at the ingress.
+    preferring ``<APP_NAME>-api``. The resolved URL carries the ``/download`` path; it
+    holds no credential, so a leaked link alone still gets 401 at the ingress.
     """
     import httpx
     import structlog
@@ -453,8 +474,9 @@ async def _discover_api_module_url() -> str:
     base_url = (workflows_env.workflows_base_url or "").rstrip("/")
     if not base_url.startswith("https://"):
         logger.warning("resolve_download_url: WORKFLOWS_BASE_URL is not https")
-        return ""
+        return DownloadUrlResolution(detail="WORKFLOWS_BASE_URL is not https")
     preferred = f"{app_name}-api" if app_name else ""
+    notes: list[str] = []
     try:
         headers = {"Authorization": f"Bearer {mistral_app_token()}"}
         async with httpx.AsyncClient(base_url=base_url, timeout=15) as client:
@@ -466,8 +488,14 @@ async def _discover_api_module_url() -> str:
                     endpoint = _deployment_endpoint(response.json())
                     if endpoint:
                         logger.info("resolve_download_url: found by deployment name", deployment=preferred)
-                        return f"{endpoint.rstrip('/')}/download"
+                        return DownloadUrlResolution(
+                            url=f"{endpoint.rstrip('/')}/download",
+                            source="deployment-name",
+                            detail=f"GET /v1/workflows/deployments/{preferred} -> managed.status.endpoint {endpoint}",
+                        )
+                    notes.append(f"GET /v1/workflows/deployments/{preferred} -> 200 but no https endpoint")
                 else:
+                    notes.append(f"GET /v1/workflows/deployments/{preferred} -> HTTP {response.status_code}")
                     logger.warning(
                         "resolve_download_url: name lookup missed",
                         deployment=preferred,
@@ -482,16 +510,24 @@ async def _discover_api_module_url() -> str:
                 logger.warning(
                     "resolve_download_url: deployments list failed", status=listed.status_code
                 )
-                return ""
+                notes.append(f"GET /v1/workflows/deployments -> HTTP {listed.status_code}")
+                return DownloadUrlResolution(detail="; ".join(notes))
+            items = listed.json().get("deployments") or []
             candidates: list[tuple[str, str]] = []
-            for item in listed.json().get("deployments") or []:
+            names: list[str] = []
+            for item in items:
                 name = str(item.get("name") or "")
+                names.append(name)
                 endpoint = _deployment_endpoint(item)
                 if name.endswith("-api") and endpoint:
                     candidates.append((name, endpoint))
             if not candidates:
                 logger.warning("resolve_download_url: no active *-api deployment with an endpoint")
-                return ""
+                shown = ", ".join(names[:20]) + ("..." if len(names) > 20 else "")
+                notes.append(
+                    f"GET /v1/workflows/deployments -> {len(items)} deployment(s) [{shown}]; none named *-api with an https endpoint"
+                )
+                return DownloadUrlResolution(detail="; ".join(notes))
             candidates.sort(key=lambda candidate: (candidate[0] != preferred, candidate[0]))
             chosen_name, chosen_endpoint = candidates[0]
             if len(candidates) > 1:
@@ -501,10 +537,16 @@ async def _discover_api_module_url() -> str:
                     candidates=[name for name, _ in candidates],
                 )
             logger.info("resolve_download_url: guessed from the deployments list", deployment=chosen_name)
-            return f"{chosen_endpoint.rstrip('/')}/download"
+            chosen = f"chose '{chosen_name}' of [{', '.join(name for name, _ in candidates)}]"
+            return DownloadUrlResolution(
+                url=f"{chosen_endpoint.rstrip('/')}/download",
+                source="deployments-list",
+                detail="; ".join(notes + [chosen]) if notes else chosen,
+            )
     except Exception as error:
         logger.warning("resolve_download_url: failed", error=type(error).__name__)
-        return ""
+        notes.append(f"error={type(error).__name__}")
+        return DownloadUrlResolution(detail="; ".join(notes))
 
 
 @workflows.activity(
@@ -513,28 +555,29 @@ async def _discover_api_module_url() -> str:
     retry_policy_max_attempts=3,
     retry_policy_backoff_coefficient=2.0,
 )
-async def resolve_download_url(_: ResolveDownloadUrlInput) -> str:
-    """The direct-download URL of the deployed ``api`` module, or ``""`` when it cannot be resolved.
+async def resolve_download_url(_: ResolveDownloadUrlInput) -> DownloadUrlResolution:
+    """Resolve the direct-download URL of the deployed ``api`` module, with an explanation.
 
     ``APP_DOWNLOAD_URL`` wins when set (explicit override, used verbatim); otherwise the
     URL is guessed from the deployments API (see :func:`_discover_api_module_url`) and the
-    ``/download`` path is appended. Any failure resolves to ``""``, so the chat keeps its
-    artifact-only behaviour. The URL carries no credential: access stays gated by caller
+    ``/download`` path is appended. Any failure resolves to an empty URL, so the chat
+    keeps its artifact-only behaviour, while ``source``/``detail`` say exactly what was
+    tried and what came back. The URL carries no credential: access stays gated by caller
     authentication at the platform ingress.
     """
     override = os.environ.get("APP_DOWNLOAD_URL", "").strip()
     if override:
-        return override
+        return DownloadUrlResolution(url=override, source="override", detail="APP_DOWNLOAD_URL set, used verbatim")
     global _api_module_url_cache
     if _api_module_url_cache is not None:
         return _api_module_url_cache
     try:
-        url = await _discover_api_module_url()
-    except Exception:
-        return ""
-    if url:
-        _api_module_url_cache = url
-    return url
+        resolution = await _discover_api_module_url()
+    except Exception as error:
+        resolution = DownloadUrlResolution(detail=f"error={type(error).__name__}")
+    if resolution.url:
+        _api_module_url_cache = resolution
+    return resolution
 
 
 @workflows.activity(
@@ -592,7 +635,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         if isinstance(value, (int, float)):
             existing.append(int(value))
     next_test_id = max(existing, default=0) + 1
-    download_url = await resolve_download_url(ResolveDownloadUrlInput())
+    resolution = await resolve_download_url(ResolveDownloadUrlInput())
     return SheetState(
         base64_content=content_b64,
         blob_sha=blob_sha,
@@ -600,7 +643,8 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         existing_test_ids=existing,
         headers=list(mapping.keys()),
         file_name=os.path.basename(cfg["path"]),
-        download_url=download_url,
+        download_url=resolution.url,
+        download_url_detail=resolution.explanation,
     )
 
 
@@ -782,6 +826,7 @@ class UpdateGitHubLog:
                 test_id=test_id,
                 message=f"DRY RUN — would commit: {message}",
                 download_url=state.download_url,
+                download_url_detail=state.download_url_detail,
             )
         commit = await commit_testlog(
             CommitTestLogInput(
@@ -811,4 +856,5 @@ class UpdateGitHubLog:
             file_url=commit.file_url,
             verified=True,
             download_url=state.download_url,
+            download_url_detail=state.download_url_detail,
         )
