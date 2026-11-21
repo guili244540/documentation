@@ -90,12 +90,15 @@ async def test_download_output_carries_file_id(
     result = await start_and_run(temporal_env, {})
 
     assert result["file_id"] == "file-1"
+    assert result["signed_url"] == "https://files.test/signed/file-1?expiry=1"
     assert "test-token" not in result["file_id"]
+    assert "test-token" not in result["signed_url"]
     assert len(files.uploads) == 1
     upload = files.uploads[0]
     assert upload["file"]["file_name"] == "Response Repository Matrix.xlsx"
     assert upload["purpose"] == "ocr"
     assert upload["visibility"] == "workspace"
+    assert files.signed_urls == [{"file_id": "file-1", "expiry": 1}]
 
 
 async def test_download_output_has_empty_file_id_when_upload_fails(
@@ -108,4 +111,5 @@ async def test_download_output_has_empty_file_id_when_upload_fails(
     result = await start_and_run(temporal_env, {})
 
     assert result["file_id"] == ""
+    assert result["signed_url"] == ""
     assert result["base64_content"]  # the inline artifact path still works

@@ -121,10 +121,13 @@ def install_fake_github(monkeypatch: pytest.MonkeyPatch, fake: FakeGitHub) -> No
 class FakeFilesAPI:
     """Serves the Mistral Files API from memory: uploads return sequential file ids."""
 
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, fail_sign: bool = False, fail_delete: bool = False) -> None:
         self.uploads: list[dict] = []
+        self.signed_urls: list[dict] = []
         self.deleted: list[str] = []
         self.fail = fail
+        self.fail_sign = fail_sign
+        self.fail_delete = fail_delete
 
     def client(self) -> SimpleNamespace:
         api = self
@@ -138,7 +141,15 @@ class FakeFilesAPI:
                 )
                 return SimpleNamespace(id=f"file-{len(api.uploads)}")
 
+            async def get_signed_url_async(self, *, file_id, expiry=None):
+                if api.fail_sign:
+                    raise RuntimeError("signed url unavailable")
+                api.signed_urls.append({"file_id": file_id, "expiry": expiry})
+                return SimpleNamespace(url=f"https://files.test/signed/{file_id}?expiry={expiry}")
+
             async def delete_async(self, *, file_id) -> None:
+                if api.fail_delete:
+                    raise RuntimeError("delete unavailable")
                 api.deleted.append(file_id)
 
         return SimpleNamespace(files=_Files())
@@ -148,6 +159,7 @@ def install_fake_files(monkeypatch: pytest.MonkeyPatch, fake: FakeFilesAPI) -> N
     monkeypatch.setattr(update_github_log, "_files_client", lambda: fake.client())
     monkeypatch.setattr(update_github_log, "_file_id_cache", {})
     monkeypatch.setattr(update_github_log, "_last_published_file_id", None)
+    monkeypatch.setattr(update_github_log, "_published_registry", {})
 
 
 async def start_and_run(temporal_env, input: dict) -> dict:
@@ -393,6 +405,14 @@ async def test_committed_output_carries_file_id(
     assert result["verified"] is True
     # The output points at the post-commit blob: the read published file-1, the verify published file-2.
     assert result["file_id"] == "file-2"
+    assert result["signed_url"] == "https://files.test/signed/file-2?expiry=1"
     assert "test-token" not in result["file_id"]
+    assert "test-token" not in result["signed_url"]
     assert len(files.uploads) == 2
+    assert files.signed_urls == [
+        {"file_id": "file-1", "expiry": 1},
+        {"file_id": "file-2", "expiry": 1},
+    ]
     assert files.deleted == ["file-1"]
+    # Both uploads are registered for the retention purge.
+    assert set(update_github_log._published_registry) == {"file-2"}  # file-1 was superseded
