@@ -3,14 +3,16 @@
 Read-only git commands (status, diff, log, show, etc.) are allowed and encouraged
 for inspecting the repository.
 
+## Local coding sessions
 Do not commit, push, create branches, stash, or otherwise modify git state.
 In local sessions, make file edits only and leave the repository in a
 dirty working state; the owner handles all state-changing git operations.
 Never assume whether changes are committed; check `git status` first.
 
+## Remote coding sessions (Vibe Code Web sandboxes)
 In remote coding sessions (Vibe Code Web sandboxes), creating a working
-branch, committing to it is allowed. Opening a pull request is allowed as the
-final step of the task. Never push directly to main.
+branch, committing (commits are allowed without the user confirmation) to it is allowed.
+Opening a pull request is allowed as the final step of the task. Never push directly to main.
 The owner handles promoting integration branches to `main`.
 
 Before creating a branch, the agent must ask the owner a branch name.
