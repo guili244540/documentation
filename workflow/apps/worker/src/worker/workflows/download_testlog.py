@@ -9,8 +9,10 @@ secret ``githubtoken`` bound as ``GITHUB_TOKEN``, never in the conversation.
 
 The chat agent that starts the execution decodes ``base64_content`` and publishes it
 as a downloadable artifact server-side; reusing ``read_testlog`` guarantees the
-returned bytes are a workbook the log updater would accept. The file name comes from
-the activity too: deterministic workflow code must not read the environment.
+returned bytes are a workbook the log updater would accept. ``download_url`` is the
+direct-download link of the deployed ``api`` module (empty when it cannot be resolved),
+so the chat can point the user at ``<app-url>/download`` as well. The file name and the
+URL come from the activity too: deterministic workflow code must not read the environment.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ class DownloadTestLogOutput(BaseModel):
     size_bytes: int
     next_test_id: int
     existing_test_ids: list[int]
+    download_url: str = ""
 
 
 @workflows.workflow.define(name="download-testlog")
@@ -49,4 +52,5 @@ class DownloadTestLog:
             size_bytes=len(content),
             next_test_id=state.next_test_id,
             existing_test_ids=state.existing_test_ids,
+            download_url=state.download_url,
         )

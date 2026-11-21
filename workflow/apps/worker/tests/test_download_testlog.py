@@ -22,6 +22,7 @@ from test_update_github_log import (
     install_fake_github,
     make_workbook_b64,
 )
+from worker.workflows import update_github_log
 from worker.workflows.download_testlog import DownloadTestLog
 from worker.workflows.update_github_log import EXPECTED_HEADERS, read_testlog
 
@@ -75,3 +76,34 @@ async def test_download_writes_nothing(
     await start_and_run(temporal_env, {})
 
     assert fake.put_payloads == []
+
+
+DOWNLOAD_URL = "https://example.test/update-github-log-api/download"
+
+
+async def test_download_output_carries_download_url_when_configured(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    monkeypatch.setenv("APP_DOWNLOAD_URL", DOWNLOAD_URL)
+
+    result = await start_and_run(temporal_env, {})
+
+    assert result["download_url"] == DOWNLOAD_URL
+    # The link carries no credential: the GitHub token of the test env must not appear in it.
+    assert "test-token" not in result["download_url"]
+
+
+async def test_download_output_has_empty_download_url_when_unset(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    monkeypatch.delenv("APP_DOWNLOAD_URL", raising=False)
+    # No app credential in the test env, so the deployments lookup cannot run: empty, not an error.
+    monkeypatch.setattr(update_github_log, "_api_module_url_cache", None)
+
+    result = await start_and_run(temporal_env, {})
+
+    assert result["download_url"] == ""

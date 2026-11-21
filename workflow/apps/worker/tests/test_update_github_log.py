@@ -345,3 +345,50 @@ async def test_update_requires_existing_explicit_test_id(
         )
 
     assert fake.put_payloads == []
+
+
+DOWNLOAD_URL = "https://example.test/update-github-log-api/download"
+
+
+async def test_dry_run_output_carries_download_url(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    monkeypatch.setenv("APP_DOWNLOAD_URL", DOWNLOAD_URL)
+
+    result = await start_and_run(
+        temporal_env, {"entry": {"question": "Can it work?", "quality": 5}, "dry_run": True}
+    )
+
+    assert result["download_url"] == DOWNLOAD_URL
+    assert "test-token" not in result["download_url"]
+
+
+async def test_committed_output_carries_download_url(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    monkeypatch.setenv("APP_DOWNLOAD_URL", DOWNLOAD_URL)
+
+    result = await start_and_run(temporal_env, {"entry": {"question": "New?", "quality": 5}})
+
+    assert result["verified"] is True
+    assert result["download_url"] == DOWNLOAD_URL
+    assert "test-token" not in result["download_url"]
+
+
+async def test_output_has_empty_download_url_when_unset(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    monkeypatch.delenv("APP_DOWNLOAD_URL", raising=False)
+    monkeypatch.setattr(update_github_log, "_api_module_url_cache", None)
+
+    result = await start_and_run(
+        temporal_env, {"entry": {"question": "New?", "quality": 5}, "dry_run": True}
+    )
+
+    assert result["download_url"] == ""

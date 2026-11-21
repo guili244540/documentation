@@ -118,6 +118,7 @@ class UpdateGitHubLogOutput(BaseModel):
     commit_url: str | None = None
     file_url: str | None = None
     verified: bool | None = None
+    download_url: str = ""
 
 
 class ReadTestLogInput(BaseModel):
@@ -132,6 +133,7 @@ class SheetState(BaseModel):
     existing_test_ids: list[int]
     headers: list[str]
     file_name: str
+    download_url: str = ""
 
 
 class CommitTestLogInput(BaseModel):
@@ -407,6 +409,63 @@ def _last_data_row(ws: object, header_row: int) -> int:
     return last
 
 
+class ResolveDownloadUrlInput(BaseModel):
+    """``resolve_download_url`` takes no business input; its configuration is worker env."""
+
+
+#: The ``<app>-api`` deployment's URL is stable for the life of the app, so it is looked up
+#: once per worker process. A Mistral API call, so it stays out of ``GITHUB_API_RATE_LIMIT``.
+_api_module_url_cache: str | None = None
+
+
+@workflows.activity(
+    name="resolve-download-url",
+    start_to_close_timeout=timedelta(seconds=30),
+    retry_policy_max_attempts=3,
+    retry_policy_backoff_coefficient=2.0,
+)
+async def resolve_download_url(_: ResolveDownloadUrlInput) -> str:
+    """The direct-download URL of the deployed ``api`` module, or ``""`` when it cannot be resolved.
+
+    ``APP_DOWNLOAD_URL`` wins when set (explicit override); otherwise the endpoint of the
+    ``<app>-api`` deployment is read from the deployments API, app name from ``APP_NAME``.
+    Any failure resolves to ``""``, so the chat keeps its artifact-only behaviour. The URL
+    carries no credential: access stays gated by caller authentication at the platform ingress.
+    """
+    import httpx
+
+    override = os.environ.get("APP_DOWNLOAD_URL", "").strip()
+    if override:
+        return override
+    global _api_module_url_cache
+    if _api_module_url_cache is not None:
+        return _api_module_url_cache
+    try:
+        from env.app import env as app_env
+        from env.workflows import env as workflows_env
+        from utils.mistral import mistral_app_token
+
+        app_name = (app_env.app_name or "").strip()
+        base_url = (workflows_env.workflows_base_url or "").rstrip("/")
+        if not app_name or not base_url.startswith("https://"):
+            return ""
+        async with httpx.AsyncClient(base_url=base_url, timeout=15) as client:
+            response = await client.get(
+                f"/v1/workflows/deployments/{app_name}-api",
+                headers={"Authorization": f"Bearer {mistral_app_token()}"},
+            )
+        if response.status_code != 200:
+            return ""
+        body = response.json()
+        endpoint = (((body.get("managed") or {}).get("status")) or {}).get("endpoint") or ""
+        if not endpoint.startswith("https://"):
+            return ""
+        _api_module_url_cache = endpoint
+        return endpoint
+    except Exception:
+        return ""
+
+
 @workflows.activity(
     name="github-read-testlog",
     start_to_close_timeout=timedelta(seconds=30),
@@ -462,6 +521,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         if isinstance(value, (int, float)):
             existing.append(int(value))
     next_test_id = max(existing, default=0) + 1
+    download_url = await resolve_download_url(ResolveDownloadUrlInput())
     return SheetState(
         base64_content=content_b64,
         blob_sha=blob_sha,
@@ -469,6 +529,7 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         existing_test_ids=existing,
         headers=list(mapping.keys()),
         file_name=os.path.basename(cfg["path"]),
+        download_url=download_url,
     )
 
 
@@ -649,6 +710,7 @@ class UpdateGitHubLog:
                 dry_run=True,
                 test_id=test_id,
                 message=f"DRY RUN — would commit: {message}",
+                download_url=state.download_url,
             )
         commit = await commit_testlog(
             CommitTestLogInput(
@@ -677,4 +739,5 @@ class UpdateGitHubLog:
             commit_url=commit.commit_url,
             file_url=commit.file_url,
             verified=True,
+            download_url=state.download_url,
         )
