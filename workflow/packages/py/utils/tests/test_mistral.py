@@ -20,6 +20,7 @@ from utils.mistral import (
     mistral_api_url,
     mistral_app_token,
     mistral_client,
+    mistral_client_with_api_key,
     mistral_credential_configured,
 )
 
@@ -60,6 +61,20 @@ def test_background_work_spends_the_apps_own_key_against_its_base_url(monkeypatc
 def test_background_work_can_target_another_mistral_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(mistral_clients.env, "mistral_base_url", "https://dedicated.test")
     assert mistral_client(server_url="https://workflows.test").sdk_configuration.server_url == "https://workflows.test"
+
+
+def test_an_explicit_key_wins_over_the_app_credential_and_keeps_the_base_url(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    token_file = tmp_path / "sa-token"
+    token_file.write_text("sa-token")
+    monkeypatch.setenv("MISTRAL_SA_TOKEN_PATH", str(token_file))
+    monkeypatch.setattr(mistral_clients.env, "mistral_base_url", "https://dedicated.test")
+
+    client = mistral_client_with_api_key("files-key")
+
+    assert client.sdk_configuration.security.api_key == "files-key"
+    assert client.sdk_configuration.server_url == "https://dedicated.test"
 
 
 @pytest.mark.parametrize(

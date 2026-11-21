@@ -8,6 +8,7 @@ import base64
 
 import pytest
 
+import utils.mistral
 from test_update_github_log import FakeFilesAPI, install_fake_files
 from worker.workflows import update_github_log
 from worker.workflows.update_github_log import PublishTestLogFileInput, publish_testlog_file
@@ -38,7 +39,7 @@ async def test_upload_returns_file_id(monkeypatch: pytest.MonkeyPatch) -> None:
     assert upload["file"]["content"] == CONTENT
     assert upload["purpose"] == "ocr"
     assert upload["visibility"] == "workspace"
-    assert upload["expiry"] == update_github_log.FILES_UPLOAD_EXPIRY_HOURS
+    assert upload["expiry"] is None  # not sent: the proven upload call omits it
 
 
 async def test_unchanged_blob_is_not_reuploaded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -80,3 +81,18 @@ async def test_upload_failure_returns_empty_and_is_not_cached(
     files.fail = False
     assert await publish_testlog_file(make_input()) == "file-1"
     assert update_github_log._file_id_cache == {"blob-1": "file-1"}
+
+
+def test_files_client_prefers_the_files_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    spent: list[str] = []
+    monkeypatch.setattr(
+        utils.mistral, "mistral_client_with_api_key", lambda key: spent.append(key) or "key-client"
+    )
+    monkeypatch.setattr(utils.mistral, "mistral_client", lambda: "sa-token-client")
+
+    monkeypatch.setenv("FILES_API_KEY", "files-key")
+    assert update_github_log._files_client() == "key-client"
+    assert spent == ["files-key"]
+
+    monkeypatch.delenv("FILES_API_KEY")
+    assert update_github_log._files_client() == "sa-token-client"

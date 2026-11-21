@@ -66,9 +66,6 @@ GITHUB_API_RATE_LIMIT = workflows.RateLimit(
 #: Media type of the log workbook, sent as the Files API upload's content type.
 XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
-#: Uploaded workbooks expire after a week unless superseded earlier (the Files API takes hours).
-FILES_UPLOAD_EXPIRY_HOURS = 24 * 7
-
 
 class NewTestEntry(BaseModel):
     """One row to append to the log.
@@ -430,9 +427,17 @@ _last_published_file_id: str | None = None
 
 
 def _files_client() -> object:
-    """The Mistral client for Files API calls, acting as the app itself. Tests monkeypatch this seam."""
-    from utils.mistral import mistral_client
+    """The Mistral client for Files API calls. Tests monkeypatch this seam.
 
+    Prefers ``FILES_API_KEY`` (a workspace API key bound as a deployment secret): the worker's
+    service-account token is scoped to the Workflows control plane and the public Files API
+    refuses it with 401/403. Falls back to the app's own credential when no key is bound.
+    """
+    from utils.mistral import mistral_client, mistral_client_with_api_key
+
+    api_key = os.environ.get("FILES_API_KEY", "").strip()
+    if api_key:
+        return mistral_client_with_api_key(api_key)
     return mistral_client()
 
 
@@ -451,7 +456,7 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> str:
     cached by blob sha — an unchanged file is not re-uploaded — and when the blob changes
     the superseded upload is deleted best-effort. A Mistral API call, so it stays out of
     ``GITHUB_API_RATE_LIMIT``. Any failure resolves to ``""`` so the inline artifact path
-    keeps working; the token never appears in the result or the logs.
+    keeps working; the key/token never appears in the result or the logs.
     """
     import base64
     import structlog
@@ -471,7 +476,6 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> str:
             },
             purpose="ocr",
             visibility="workspace",
-            expiry=FILES_UPLOAD_EXPIRY_HOURS,
         )
         file_id = str(upload.id)
         global _last_published_file_id
@@ -494,7 +498,12 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> str:
         )
         return file_id
     except Exception as error:
-        logger.warning("publish_testlog_file: upload failed", error=type(error).__name__)
+        status = getattr(error, "status_code", None)
+        logger.warning(
+            "publish_testlog_file: upload failed",
+            error=type(error).__name__,
+            status=status,
+        )
         return ""
 
 

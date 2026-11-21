@@ -31,10 +31,11 @@
 
 ### What changed (approach 2, implemented on this branch)
 
-1. **`workflow/apps/worker/src/worker/workflows/update_github_log.py`** — new activity `publish-testlog-file` (details in `IMPLEMENTATION_PLAN.md` §3): uploads the workbook bytes with the worker's service-account client (`client.files.upload`, `visibility="workspace"`, an `expiry`, purpose verified against the live API), caches by blob sha so an unchanged file is not re-uploaded, and deletes the superseded upload when the blob changes. Runs inside the activity only (determinism rule: no env reads or side effects in workflow bodies); it is a Mistral API call, so it stays out of `GITHUB_API_RATE_LIMIT`.
+1. **`workflow/apps/worker/src/worker/workflows/update_github_log.py`** — new activity `publish-testlog-file` (details in `IMPLEMENTATION_PLAN.md` §3): uploads the workbook bytes via `client.files.upload` with `purpose="ocr"` and `visibility="workspace"` — the exact shape proven live with curl on 2026-11-21 — authenticated by `FILES_API_KEY`, because the worker's service-account token is scoped to the Workflows API and `/v1/files` refuses it with 401/403. Caches by blob sha so an unchanged file is not re-uploaded, and deletes the superseded upload when the blob changes. Runs inside the activity only (determinism rule: no env reads or side effects in workflow bodies); it is a Mistral API call, so it stays out of `GITHUB_API_RATE_LIMIT`.
 2. **`SheetState` gains `file_id: str = ""`**, filled by `read_testlog`; both `DownloadTestLogOutput` and `UpdateGitHubLogOutput` gain `file_id: str = ""` (empty when the upload fails → callers fall back to the inline artifact). No new env vars, no `mistral.json` change, no new module.
 3. **Tests** in `workflow/apps/worker/tests/`, same style as the existing ones (mocked HTTP through a client seam): `file_id` present and token-free in both workflows' outputs when the upload succeeds; empty on upload failure; no re-upload when the blob sha is unchanged; no token material in outputs or logs.
-4. **README** (`README.md`): document both approaches — the inline artifact (today) and the Files API reference (how to download with your own token).
+4. **`workflow/.env.example`** — declare `FILES_API_KEY=` (name only); at deploy time bind it from a workspace secret holding an API key with Files access (`PATCH /v1/workflows/deployments/update-github-log-worker`, same pattern as `GITHUB_TOKEN`).
+5. **README** (`README.md`): document both approaches — the inline artifact (today) and the Files API reference (how to download with your own token), plus the `FILES_API_KEY` deploy binding.
 5. **Chat agent instructions (R7, Studio side, out of this repo):** after a successful `update-github-log` and on a download request, mention the `file_id` from the result; the artifact stays as fallback.
 
 ## 4. Why
@@ -69,7 +70,7 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 ## 6. Constraints
 
 - **C1 — No new exposure.** No public ingress, tunnels, relays, reverse proxies, broad listeners, or "anyone with the link" access; no HTTP server module is added; the worker keeps `routes: []` / `port: null`.
-- **C2 — Secret hygiene.** `GITHUB_TOKEN` is read only inside activities, `GITHUB_API_BASE_URL` must stay https, and no secret may appear in outputs, logs, or errors. The worker's SA token is used only for the upload, server-side.
+- **C2 — Secret hygiene.** `GITHUB_TOKEN` is read only inside activities, `GITHUB_API_BASE_URL` must stay https, and no secret may appear in outputs, logs, or errors. `FILES_API_KEY` is likewise read only inside the `publish-testlog-file` activity and only ever placed in the client's credential; the worker's SA token is never used for the Files API.
 - **C3 — Worker untouched structurally.** No HTTP listener in the worker process (R6); no new app module in `mistral.json`.
 - **C4 — Determinism.** Side effects and environment reads stay inside activities; repo/path/branch/sheet stay `GITHUB_LOG_*` configuration, not workflow input; columns keep being matched by header name.
 - **C5 — Rate limiting.** GitHub reads go through activities under the shared `GITHUB_API_RATE_LIMIT`. Files API calls are Mistral API calls: keep them out of that limiter, and rely on the blob-sha cache to keep volume at ~1 upload per file change.
@@ -113,7 +114,7 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 - The `api`-module code from phase 1 is removed in this revision; `SPEC.md` lives at the repository root.
 - Direct download = the worker pushes the file out (Files API) and returns the reference; there is no download path into a managed-deployment container.
 - `file_id` is returned on both workflow outputs, empty on failure; callers authenticate at the Files API with their own token.
-- No signed URLs, no object storage, no new module, no new env vars.
+- No signed URLs, no object storage, no new module. One new env var: `FILES_API_KEY` (a workspace API key bound as a deployment secret), because the worker's SA token cannot call `/v1/files` (verified live 2026-11-21: upload/download with a user key work; the SA token gets 401/403 there). Upload params match the proven curl exactly: `purpose="ocr"`, `visibility="workspace"`, no `expiry` (cleanup is delete-on-supersede; an `expiry` can be added once its accepted range is verified live). Failure logging carries the error class and HTTP status, never the key.
 
 ## 11. Findings from the deployed worker (2026-11-21)
 

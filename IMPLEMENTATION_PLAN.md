@@ -20,7 +20,9 @@
 
 | File | Change |
 |---|---|
-| `workflow/apps/worker/src/worker/workflows/update_github_log.py` | New `publish-testlog-file` activity next to the GitHub activities: builds the app's Mistral client from the SA token (`utils.mistral.mistral_client()`, i.e. `MISTRAL_SA_TOKEN_PATH`), uploads the workbook bytes via `client.files.upload_async(file=..., purpose=<verified>, visibility="workspace", expiry=<chosen>)`, caches `blob_sha -> file_id` in-process so an unchanged file is not re-uploaded, and deletes the superseded upload (`client.files.delete_async`) when the blob changes. Returns the `file_id` (or `""` on any failure — never raises into the workflow). Mistral API call, so **not** under `GITHUB_API_RATE_LIMIT`. Verify the accepted `purpose` against the live API first (SDK literals: `fine-tune`/`batch`/`ocr`/`agentic_safety`; `ocr` expected for an arbitrary xlsx). |
+| `workflow/apps/worker/src/worker/workflows/update_github_log.py` | New `publish-testlog-file` activity next to the GitHub activities: builds the Files API client from `FILES_API_KEY` when bound (`utils.mistral.mistral_client_with_api_key`, new helper), falling back to the app credential — the worker SA token is scoped to the Workflows API and `/v1/files` refuses it (401/403, verified live 2026-11-21). Uploads via `client.files.upload_async(file={"file_name", "content", "content_type"}, purpose="ocr", visibility="workspace")` — exactly the curl-proven shape, no `expiry` — caches `blob_sha -> file_id` in-process so an unchanged file is not re-uploaded, deletes the superseded upload (`client.files.delete_async`) when the blob changes, and logs the error class + HTTP status on failure (never the key). Returns the `file_id` (or `""` on any failure — never raises into the workflow). Mistral API call, so **not** under `GITHUB_API_RATE_LIMIT`. |
+| `workflow/packages/py/utils/src/utils/mistral.py` | New `mistral_client_with_api_key(api_key)` helper: a client spending an explicit workspace key against `MISTRAL_BASE_URL`, for calls the app's own credential cannot make. Covered in `packages/py/utils/tests/test_mistral.py`. |
+| `workflow/.env.example` | Declare `FILES_API_KEY=` (name only). |
 | same file | `SheetState` gains `file_id: str = ""`; `read_testlog` fills it by calling the activity (activity-in-activity runs inline); `UpdateGitHubLogOutput` gains `file_id: str = ""`, set on both the dry-run and the committed return paths. |
 | `workflow/apps/worker/src/worker/workflows/download_testlog.py` | `DownloadTestLogOutput` gains `file_id: str = ""`, set from `state.file_id`. |
 | `workflow/apps/worker/tests/test_update_github_log.py`, `test_download_testlog.py` | New cases with a mocked Files API through a client seam: `file_id` present and token-free in both outputs on success; empty when the upload fails; no second upload when the blob sha is unchanged; no token material in outputs. Existing tests unchanged. |
@@ -31,7 +33,7 @@ No changes to `mistral.json`, no new module, no new env vars, no Dockerfile chan
 ## 4. Technical approach
 
 - **Upload inside an activity** (determinism rule C4): `publish-testlog-file` runs in the worker process with the SA token; the workflow only passes the bytes/blob sha through `SheetState`. No env reads in workflow bodies.
-- **Client:** `mistral_client()` from `utils.mistral` (SA token file, re-read per client build) against `env.mistral_base_url` / the public API — the Files API lives on the main Mistral API host, not `WORKFLOWS_BASE_URL`. Tests monkeypatch the client factory seam, so no network.
+- **Client:** `FILES_API_KEY` when bound (workspace key, read inside the activity; new `mistral_client_with_api_key` helper in `utils.mistral`), else the app credential. Both target `env.mistral_base_url` / the public API — the Files API lives on the main Mistral API host, not `WORKFLOWS_BASE_URL`. Tests monkeypatch the `_files_client` seam, so no network.
 - **Dedup/cleanup:** in-process `dict[blob_sha, file_id]`; on a new blob sha, upload then delete the previous file id (best-effort, logged on failure) and always set an `expiry` on upload so orphaned files self-delete.
 - **Failure semantics:** any upload error → `file_id = ""` and a warning log line (never the token); the inline artifact path keeps working (R5/C8).
 - **Security:** `file_id` is not a capability — download requires the caller's own token at `/v1/files/{id}/content` (C10/R2). No signed URLs. `GITHUB_TOKEN` untouched (C2).
@@ -40,7 +42,7 @@ No changes to `mistral.json`, no new module, no new env vars, no Dockerfile chan
 
 1. `publish-testlog-file` activity + `file_id` on `SheetState`/both outputs + tests — done (direct activity tests plus workflow-level cases; `verify_testlog` also publishes the post-commit blob so an update's `file_id` is current).
 2. README field-name/command check — done.
-3. Deploy (`mistral apps deploy` from `workflow/`) and verify end-to-end: run `download-testlog`, take `file_id`, download with a workspace token, compare sha; confirm 401 without a token — remaining manual step.
+3. Deploy (`mistral apps deploy` from `workflow/`) and bind `FILES_API_KEY` on `update-github-log-worker` from a workspace secret (`PATCH /v1/workflows/deployments/update-github-log-worker`, same pattern as the `GITHUB_TOKEN` binding in the managed-deployments guide). Then verify end-to-end: run `download-testlog`, take `file_id`, download with a workspace token, compare sha; confirm 401 without a token; check the worker log shows `publish_testlog_file: uploaded` (and `error=… status=…` on failure) — remaining manual step.
 
 ## 6. Build, deploy, verify
 
