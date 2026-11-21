@@ -413,9 +413,98 @@ class ResolveDownloadUrlInput(BaseModel):
     """``resolve_download_url`` takes no business input; its configuration is worker env."""
 
 
-#: The ``<app>-api`` deployment's URL is stable for the life of the app, so it is looked up
-#: once per worker process. A Mistral API call, so it stays out of ``GITHUB_API_RATE_LIMIT``.
+#: The ``api`` module's URL is stable for the life of the app, so it is looked up once per
+#: worker process. A Mistral API call, so it stays out of ``GITHUB_API_RATE_LIMIT``.
 _api_module_url_cache: str | None = None
+
+
+def _deployment_endpoint(body: object) -> str:
+    """The https ingress endpoint of a deployment payload, or ``""`` when there is none."""
+    if not isinstance(body, dict):
+        return ""
+    managed = body.get("managed")
+    if not isinstance(managed, dict):
+        return ""
+    status = managed.get("status")
+    if not isinstance(status, dict):
+        return ""
+    endpoint = status.get("endpoint")
+    return endpoint if isinstance(endpoint, str) and endpoint.startswith("https://") else ""
+
+
+async def _discover_api_module_url() -> str:
+    """Guess the deployed ``api`` module's download URL, or ``""`` when nothing matches.
+
+    Looks up ``<APP_NAME>-api`` by name first; when that misses (the app name is not what
+    the deployment is named, or the module is not deployed yet), lists the active
+    deployments and takes the one named ``*-api`` that exposes an https endpoint,
+    preferring ``<APP_NAME>-api``. The result carries the ``/download`` path; it holds no
+    credential, so a leaked link alone still gets 401 at the ingress.
+    """
+    import httpx
+    import structlog
+
+    from env.app import env as app_env
+    from env.workflows import env as workflows_env
+    from utils.mistral import mistral_app_token
+
+    logger = structlog.get_logger("workflows.resolve_download_url")
+    app_name = (app_env.app_name or "").strip()
+    base_url = (workflows_env.workflows_base_url or "").rstrip("/")
+    if not base_url.startswith("https://"):
+        logger.warning("resolve_download_url: WORKFLOWS_BASE_URL is not https")
+        return ""
+    preferred = f"{app_name}-api" if app_name else ""
+    try:
+        headers = {"Authorization": f"Bearer {mistral_app_token()}"}
+        async with httpx.AsyncClient(base_url=base_url, timeout=15) as client:
+            if preferred:
+                response = await client.get(
+                    f"/v1/workflows/deployments/{preferred}", headers=headers
+                )
+                if response.status_code == 200:
+                    endpoint = _deployment_endpoint(response.json())
+                    if endpoint:
+                        logger.info("resolve_download_url: found by deployment name", deployment=preferred)
+                        return f"{endpoint.rstrip('/')}/download"
+                else:
+                    logger.warning(
+                        "resolve_download_url: name lookup missed",
+                        deployment=preferred,
+                        status=response.status_code,
+                    )
+            listed = await client.get(
+                "/v1/workflows/deployments",
+                params={"active_only": True, "limit": 100},
+                headers=headers,
+            )
+            if listed.status_code != 200:
+                logger.warning(
+                    "resolve_download_url: deployments list failed", status=listed.status_code
+                )
+                return ""
+            candidates: list[tuple[str, str]] = []
+            for item in listed.json().get("deployments") or []:
+                name = str(item.get("name") or "")
+                endpoint = _deployment_endpoint(item)
+                if name.endswith("-api") and endpoint:
+                    candidates.append((name, endpoint))
+            if not candidates:
+                logger.warning("resolve_download_url: no active *-api deployment with an endpoint")
+                return ""
+            candidates.sort(key=lambda candidate: (candidate[0] != preferred, candidate[0]))
+            chosen_name, chosen_endpoint = candidates[0]
+            if len(candidates) > 1:
+                logger.warning(
+                    "resolve_download_url: several -api deployments, chose one",
+                    chosen=chosen_name,
+                    candidates=[name for name, _ in candidates],
+                )
+            logger.info("resolve_download_url: guessed from the deployments list", deployment=chosen_name)
+            return f"{chosen_endpoint.rstrip('/')}/download"
+    except Exception as error:
+        logger.warning("resolve_download_url: failed", error=type(error).__name__)
+        return ""
 
 
 @workflows.activity(
@@ -427,13 +516,12 @@ _api_module_url_cache: str | None = None
 async def resolve_download_url(_: ResolveDownloadUrlInput) -> str:
     """The direct-download URL of the deployed ``api`` module, or ``""`` when it cannot be resolved.
 
-    ``APP_DOWNLOAD_URL`` wins when set (explicit override); otherwise the endpoint of the
-    ``<app>-api`` deployment is read from the deployments API, app name from ``APP_NAME``.
-    Any failure resolves to ``""``, so the chat keeps its artifact-only behaviour. The URL
-    carries no credential: access stays gated by caller authentication at the platform ingress.
+    ``APP_DOWNLOAD_URL`` wins when set (explicit override, used verbatim); otherwise the
+    URL is guessed from the deployments API (see :func:`_discover_api_module_url`) and the
+    ``/download`` path is appended. Any failure resolves to ``""``, so the chat keeps its
+    artifact-only behaviour. The URL carries no credential: access stays gated by caller
+    authentication at the platform ingress.
     """
-    import httpx
-
     override = os.environ.get("APP_DOWNLOAD_URL", "").strip()
     if override:
         return override
@@ -441,29 +529,12 @@ async def resolve_download_url(_: ResolveDownloadUrlInput) -> str:
     if _api_module_url_cache is not None:
         return _api_module_url_cache
     try:
-        from env.app import env as app_env
-        from env.workflows import env as workflows_env
-        from utils.mistral import mistral_app_token
-
-        app_name = (app_env.app_name or "").strip()
-        base_url = (workflows_env.workflows_base_url or "").rstrip("/")
-        if not app_name or not base_url.startswith("https://"):
-            return ""
-        async with httpx.AsyncClient(base_url=base_url, timeout=15) as client:
-            response = await client.get(
-                f"/v1/workflows/deployments/{app_name}-api",
-                headers={"Authorization": f"Bearer {mistral_app_token()}"},
-            )
-        if response.status_code != 200:
-            return ""
-        body = response.json()
-        endpoint = (((body.get("managed") or {}).get("status")) or {}).get("endpoint") or ""
-        if not endpoint.startswith("https://"):
-            return ""
-        _api_module_url_cache = endpoint
-        return endpoint
+        url = await _discover_api_module_url()
     except Exception:
         return ""
+    if url:
+        _api_module_url_cache = url
+    return url
 
 
 @workflows.activity(
