@@ -19,26 +19,6 @@
       "dev": {
         "startCommand": "bash ../../tools/uv.sh run --all-packages python -m worker.entrypoints.dev"
       }
-    },
-    {
-      "type": "app",
-      "name": "api",
-      "path": "apps/api",
-      "routes": [
-        {
-          "path": "/download"
-        }
-      ],
-      "port": 3000,
-      "serve": "server",
-      "runtime": "python",
-      "build": {
-        "context": ".",
-        "dockerfile": "deploy/docker/Dockerfile.api"
-      },
-      "dev": {
-        "startCommand": "bash ../../tools/uv.sh run --all-packages python -m api.dev"
-      }
     }
   ]
 }
