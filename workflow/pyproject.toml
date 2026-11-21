@@ -7,6 +7,14 @@ dependencies = [
     "mistralai-capabilities-deployment-apps==0.1.71",
 ]
 
+# One pytest configuration for the whole workspace, so `pytest apps/api apps/worker` from the
+# app root gets the same asyncio mode as running a single app's tests (the per-app pyprojects
+# repeat these two settings for standalone runs; without them here, a multi-app invocation
+# finds no ini file and async tests are not collected).
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+
 [tool.uv]
 package = false
 # Dependency-confusion hardening. Do not use `unsafe-best-match`, which uv's docs flag as exposing

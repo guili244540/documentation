@@ -12,6 +12,7 @@ import base64
 import io
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 
 import httpx
 import openpyxl
@@ -115,6 +116,89 @@ class FakeGitHub:
 def install_fake_github(monkeypatch: pytest.MonkeyPatch, fake: FakeGitHub) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     monkeypatch.setattr(update_github_log, "_github_async_client", fake.client_factory)
+
+
+class FakeAPIError(Exception):
+    """An HTTP-like error carrying a status code, like the Mistral SDK errors."""
+
+    def __init__(self, status_code: int, message: str = "api error") -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+class FakeFilesAPI:
+    """Serves the Mistral Files API from memory: uploads return sequential file ids."""
+
+    def __init__(
+        self,
+        fail: bool = False,
+        fail_sign: bool = False,
+        fail_delete: bool = False,
+        fail_retrieve: bool = False,
+    ) -> None:
+        self.uploads: list[dict] = []
+        self.signed_urls: list[dict] = []
+        self.deleted: list[str] = []
+        self.retrieved: list[str] = []
+        self.existing: set[str] = set()
+        self.gone: set[str] = set()
+        self.fail = fail
+        self.fail_sign = fail_sign
+        self.fail_delete = fail_delete
+        self.fail_retrieve = fail_retrieve
+
+    def delete_remotely(self, file_id: str) -> None:
+        """Simulate a deletion outside the worker (e.g. manual); not recorded in ``deleted``."""
+        self.existing.discard(file_id)
+        self.gone.add(file_id)
+
+    def client(self) -> SimpleNamespace:
+        api = self
+
+        class _Files:
+            async def upload_async(self, *, file, purpose=None, visibility=None, expiry=None):
+                if api.fail:
+                    raise RuntimeError("files api unavailable")
+                api.uploads.append(
+                    {"file": file, "purpose": purpose, "visibility": visibility, "expiry": expiry}
+                )
+                file_id = f"file-{len(api.uploads)}"
+                api.existing.add(file_id)
+                return SimpleNamespace(id=file_id)
+
+            async def retrieve_async(self, *, file_id):
+                if api.fail_retrieve:
+                    raise RuntimeError("retrieve unavailable")
+                api.retrieved.append(file_id)
+                if file_id in api.gone or file_id not in api.existing:
+                    raise FakeAPIError(404)
+                return SimpleNamespace(id=file_id)
+
+            async def get_signed_url_async(self, *, file_id, expiry=None):
+                if api.fail_sign:
+                    raise RuntimeError("signed url unavailable")
+                if file_id in api.gone or file_id not in api.existing:
+                    raise FakeAPIError(404)
+                api.signed_urls.append({"file_id": file_id, "expiry": expiry})
+                return SimpleNamespace(url=f"https://files.test/signed/{file_id}?expiry={expiry}")
+
+            async def delete_async(self, *, file_id) -> None:
+                if api.fail_delete:
+                    raise RuntimeError("delete unavailable")
+                if file_id in api.gone or file_id not in api.existing:
+                    raise FakeAPIError(404)
+                api.existing.discard(file_id)
+                api.gone.add(file_id)
+                api.deleted.append(file_id)
+
+        return SimpleNamespace(files=_Files())
+
+
+def install_fake_files(monkeypatch: pytest.MonkeyPatch, fake: FakeFilesAPI) -> None:
+    monkeypatch.setattr(update_github_log, "_files_client", lambda: fake.client())
+    monkeypatch.setattr(update_github_log, "_file_id_cache", {})
+    monkeypatch.setattr(update_github_log, "_last_published_file_id", None)
+    monkeypatch.setattr(update_github_log, "_published_registry", {})
 
 
 async def start_and_run(temporal_env, input: dict) -> dict:
@@ -345,3 +429,29 @@ async def test_update_requires_existing_explicit_test_id(
         )
 
     assert fake.put_payloads == []
+
+
+async def test_committed_output_carries_file_id(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+
+    result = await start_and_run(temporal_env, {"entry": {"question": "New?", "quality": 5}})
+
+    assert result["verified"] is True
+    # The output points at the post-commit blob: the read published file-1, the verify published file-2.
+    assert result["file_id"] == "file-2"
+    assert result["signed_url"] == "https://files.test/signed/file-2?expiry=1"
+    assert "test-token" not in result["file_id"]
+    assert "test-token" not in result["signed_url"]
+    assert len(files.uploads) == 2
+    assert files.signed_urls == [
+        {"file_id": "file-1", "expiry": 1},
+        {"file_id": "file-2", "expiry": 1},
+    ]
+    assert files.deleted == ["file-1"]
+    # Both uploads are registered for the retention purge.
+    assert set(update_github_log._published_registry) == {"file-2"}  # file-1 was superseded

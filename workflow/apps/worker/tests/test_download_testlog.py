@@ -18,7 +18,9 @@ from mistralai.workflows.testing import create_test_worker
 from test_update_github_log import (
     CLIENT_TIMEOUT,
     WORKFLOW_EXECUTION_TIMEOUT,
+    FakeFilesAPI,
     FakeGitHub,
+    install_fake_files,
     install_fake_github,
     make_workbook_b64,
 )
@@ -75,3 +77,39 @@ async def test_download_writes_nothing(
     await start_and_run(temporal_env, {})
 
     assert fake.put_payloads == []
+
+
+async def test_download_output_carries_file_id(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+
+    result = await start_and_run(temporal_env, {})
+
+    assert result["file_id"] == "file-1"
+    assert result["signed_url"] == "https://files.test/signed/file-1?expiry=1"
+    assert "test-token" not in result["file_id"]
+    assert "test-token" not in result["signed_url"]
+    assert len(files.uploads) == 1
+    upload = files.uploads[0]
+    assert upload["file"]["file_name"] == "Response Repository Matrix.xlsx"
+    assert upload["purpose"] == "ocr"
+    assert upload["visibility"] == "workspace"
+    assert files.signed_urls == [{"file_id": "file-1", "expiry": 1}]
+
+
+async def test_download_output_has_empty_file_id_when_upload_fails(
+    temporal_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake = FakeGitHub(make_workbook_b64([[1, None, "old", None, None, 5]]))
+    install_fake_github(monkeypatch, fake)
+    install_fake_files(monkeypatch, FakeFilesAPI(fail=True))
+
+    result = await start_and_run(temporal_env, {})
+
+    assert result["file_id"] == ""
+    assert result["signed_url"] == ""
+    assert result["base64_content"]  # the inline artifact path still works

@@ -152,6 +152,17 @@ def mistral_client(*, server_url: str | None = None, retry_config: OptionalNulla
     )
 
 
+def mistral_client_with_api_key(api_key: str, *, server_url: str | None = None) -> Mistral:
+    """A client authenticating with an explicit API key, against ``MISTRAL_BASE_URL``.
+
+    For calls the app's own credential cannot make: a deployed worker's service-account token is
+    scoped to the Workflows control plane, so e.g. the public Files API refuses it, and a workspace
+    key bound for that purpose (``FILES_API_KEY``) is spent instead. The key never leaves the
+    deployment: it is read here, inside the activity, and only ever put in the client's credential.
+    """
+    return _new_client(api_key, env.mistral_base_url if server_url is None else server_url)
+
+
 @lru_cache(maxsize=1)
 def _caller_client(server_url: str) -> Mistral:
     # One client serves every caller: the api_key callable runs per request, so each call

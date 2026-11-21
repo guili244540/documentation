@@ -26,6 +26,7 @@ Run shape (deterministic workflow, side effects in activities)::
 from __future__ import annotations
 
 import os
+import time
 from datetime import timedelta
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING
@@ -62,6 +63,16 @@ LISTS_HEADER_ALIASES = {
 GITHUB_API_RATE_LIMIT = workflows.RateLimit(
     time_window_in_sec=1, max_execution=30, key="github-api"
 )
+
+#: Media type of the log workbook, sent as the Files API upload's content type.
+XLSX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+
+#: Signed-URL lifetime in hours: the shortest the Files API accepts (valid range 1-168 h).
+#: The retention purge (PURGE_MAX_AGE) bounds the effective link lifetime to <= 10 min anyway.
+SIGNED_URL_EXPIRY_HOURS = 1
+
+#: Files API uploads older than this are deleted by the ``purge-testlog-files`` cron (R8/C11).
+PURGE_MAX_AGE = timedelta(minutes=5)
 
 
 class NewTestEntry(BaseModel):
@@ -118,6 +129,8 @@ class UpdateGitHubLogOutput(BaseModel):
     commit_url: str | None = None
     file_url: str | None = None
     verified: bool | None = None
+    file_id: str = ""
+    signed_url: str = ""
 
 
 class ReadTestLogInput(BaseModel):
@@ -132,6 +145,8 @@ class SheetState(BaseModel):
     existing_test_ids: list[int]
     headers: list[str]
     file_name: str
+    file_id: str = ""
+    signed_url: str = ""
 
 
 class CommitTestLogInput(BaseModel):
@@ -161,6 +176,8 @@ class VerifyTestLogInput(BaseModel):
 class VerifyResult(BaseModel):
     verified: bool
     detail: str
+    file_id: str = ""
+    signed_url: str = ""
 
 
 def _github_config() -> dict[str, object]:
@@ -407,6 +424,239 @@ def _last_data_row(ws: object, header_row: int) -> int:
     return last
 
 
+class PublishTestLogFileInput(BaseModel):
+    model_config = ConfigDict(hide_input_in_errors=True)
+    base64_content: str
+    blob_sha: str
+    file_name: str
+
+
+class PublishedFile(BaseModel):
+    """What ``publish-testlog-file`` returns: the Files API reference and its signed URL."""
+
+    file_id: str = ""
+    signed_url: str = ""
+
+
+#: blob sha -> published file, so an unchanged workbook is not re-uploaded (per worker process).
+_file_id_cache: dict[str, PublishedFile] = {}
+#: The currently published upload, so a changed blob supersedes (deletes) it.
+_last_published_file_id: str | None = None
+#: file_id -> upload time (epoch seconds): the process-local registry the purge cron deletes from.
+_published_registry: dict[str, float] = {}
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _forget_published_file(file_id: str) -> None:
+    """Drop a file id from the purge registry, the blob-sha cache and the superseded tracker."""
+    global _last_published_file_id
+    _published_registry.pop(file_id, None)
+    for blob_sha, published in list(_file_id_cache.items()):
+        if published.file_id == file_id:
+            del _file_id_cache[blob_sha]
+    if _last_published_file_id == file_id:
+        _last_published_file_id = None
+
+
+async def _refresh_signed_url(client: object, published: PublishedFile, logger) -> PublishedFile:
+    """Re-mint the signed URL so every returned link has the full TTL (keeps the old one on failure)."""
+    try:
+        signed = await client.files.get_signed_url_async(
+            file_id=published.file_id, expiry=SIGNED_URL_EXPIRY_HOURS
+        )
+        published.signed_url = str(signed.url)
+    except Exception as error:
+        logger.warning(
+            "publish_testlog_file: signed url minting failed",
+            file_id=published.file_id,
+            error=type(error).__name__,
+            status=getattr(error, "status_code", None),
+        )
+    return published
+
+
+def _files_client() -> object:
+    """The Mistral client for Files API calls. Tests monkeypatch this seam.
+
+    Prefers ``FILES_API_KEY`` (a workspace API key bound as a deployment secret): the worker's
+    service-account token is scoped to the Workflows control plane and the public Files API
+    refuses it with 401/403. Falls back to the app's own credential when no key is bound.
+    """
+    from utils.mistral import mistral_client, mistral_client_with_api_key
+
+    api_key = os.environ.get("FILES_API_KEY", "").strip()
+    if api_key:
+        return mistral_client_with_api_key(api_key)
+    return mistral_client()
+
+
+@workflows.activity(
+    name="publish-testlog-file",
+    start_to_close_timeout=timedelta(seconds=60),
+    retry_policy_max_attempts=3,
+    retry_policy_backoff_coefficient=2.0,
+)
+async def publish_testlog_file(params: PublishTestLogFileInput) -> PublishedFile:
+    """Upload the workbook to the Mistral Files API; return its ``file_id`` and ``signed_url``.
+
+    The upload is authenticated by ``FILES_API_KEY`` when bound (the worker's service-account
+    token is scoped to the Workflows control plane and ``/v1/files`` refuses it) and published
+    with workspace visibility, so any workspace member can download it with their own token from
+    ``/v1/files/{file_id}/content`` — ``file_id`` alone is not a capability. A short-lived signed
+    URL (shortest TTL the API accepts) is minted next to it for clickable chat links; the
+    retention purge bounds the effective link lifetime to ≤ 10 min. Results are cached by blob
+    sha — an unchanged file is not re-uploaded — and when the blob changes the superseded upload
+    is deleted best-effort. On a cache hit the file's existence is checked
+    (``files.retrieve_async``): a 404 (e.g. a manual deletion outside the worker) evicts the id
+    from the cache/registry and re-uploads, any other error keeps the cached reference, and the
+    signed URL is re-minted so the returned link always has the full TTL. Every upload is
+    registered for the purge. A Mistral API call, so it stays out of
+    ``GITHUB_API_RATE_LIMIT``. Any upload failure resolves to an empty ``PublishedFile`` so the
+    inline artifact path keeps working; a signed-URL failure only empties ``signed_url``; the
+    key/token never appears in the result or the logs.
+    """
+    import base64
+    import structlog
+
+    logger = structlog.get_logger("workflows.publish_testlog_file")
+    cached = _file_id_cache.get(params.blob_sha)
+    if cached and cached.file_id:
+        client = _files_client()
+        try:
+            await client.files.retrieve_async(file_id=cached.file_id)
+        except Exception as error:
+            if getattr(error, "status_code", None) != 404:
+                # Transient or inconclusive: keep the cached reference, refresh only the link.
+                return await _refresh_signed_url(client, cached, logger)
+            logger.info(
+                "publish_testlog_file: cached upload is gone, re-uploading",
+                file_id=cached.file_id,
+                blob_sha=params.blob_sha,
+            )
+            _forget_published_file(cached.file_id)
+        else:
+            return await _refresh_signed_url(client, cached, logger)
+    try:
+        client = _files_client()
+        content = base64.b64decode(params.base64_content)
+        upload = await client.files.upload_async(
+            file={
+                "file_name": params.file_name,
+                "content": content,
+                "content_type": XLSX_MEDIA_TYPE,
+            },
+            purpose="ocr",
+            visibility="workspace",
+        )
+        file_id = str(upload.id)
+        published = await _refresh_signed_url(client, PublishedFile(file_id=file_id), logger)
+        global _last_published_file_id
+        previous = _last_published_file_id
+        if previous and previous != file_id:
+            try:
+                await client.files.delete_async(file_id=previous)
+            except Exception:
+                logger.warning(
+                    "publish_testlog_file: could not delete the superseded upload",
+                    superseded_file_id=previous,
+                )
+            else:
+                _published_registry.pop(previous, None)
+        _file_id_cache[params.blob_sha] = published
+        _published_registry[file_id] = _now()
+        _last_published_file_id = file_id
+        logger.info(
+            "publish_testlog_file: uploaded",
+            file_id=file_id,
+            signed_url_minted=bool(published.signed_url),
+            blob_sha=params.blob_sha,
+            size_bytes=len(content),
+        )
+        return published
+    except Exception as error:
+        status = getattr(error, "status_code", None)
+        logger.warning(
+            "publish_testlog_file: upload failed",
+            error=type(error).__name__,
+            status=status,
+        )
+        return PublishedFile()
+
+
+class PurgeOldTestLogFilesInput(BaseModel):
+    """``purge-old-testlog-files`` takes no business input; the clock is worker-side."""
+
+
+@workflows.activity(
+    name="purge-old-testlog-files",
+    start_to_close_timeout=timedelta(seconds=60),
+    retry_policy_max_attempts=3,
+    retry_policy_backoff_coefficient=2.0,
+)
+async def purge_old_testlog_files(_: PurgeOldTestLogFilesInput) -> int:
+    """Delete the worker-registered Files API uploads older than ``PURGE_MAX_AGE``; return the count.
+
+    Only ids in the process-local registry are ever deleted — ``files.list`` is never used to
+    select deletions, so foreign files (even same-named ones) are untouched. Purged ids are also
+    dropped from the blob-sha cache and the superseded tracker, so a later read re-uploads instead
+    of returning a dead ``file_id``. A 404 on delete means the file is already gone (e.g. deleted
+    manually outside the worker): the entry is dropped and the cache reconciled. Best-effort:
+    any other delete failure is logged (error class + HTTP status, never the key) and the entry
+    stays registered for the next tick. A Mistral API call, so it stays out of
+    ``GITHUB_API_RATE_LIMIT``.
+    """
+    import structlog
+
+    logger = structlog.get_logger("workflows.purge_old_testlog_files")
+    now = _now()
+    max_age = PURGE_MAX_AGE.total_seconds()
+    stale = [file_id for file_id, uploaded_at in _published_registry.items() if now - uploaded_at > max_age]
+    if not stale:
+        return 0
+    client = _files_client()
+    deleted = 0
+    for file_id in stale:
+        try:
+            await client.files.delete_async(file_id=file_id)
+        except Exception as error:
+            if getattr(error, "status_code", None) == 404:
+                logger.info("purge_old_testlog_files: already gone", file_id=file_id)
+            else:
+                logger.warning(
+                    "purge_old_testlog_files: delete failed",
+                    file_id=file_id,
+                    error=type(error).__name__,
+                    status=getattr(error, "status_code", None),
+                )
+                continue
+        _forget_published_file(file_id)
+        deleted += 1
+        logger.info("purge_old_testlog_files: deleted", file_id=file_id)
+    return deleted
+
+
+class PurgeTestLogFilesInput(BaseModel):
+    """``purge-testlog-files`` takes no business input; it runs on a cron schedule."""
+
+
+@workflows.workflow.define(name="purge-testlog-files")
+class PurgeTestLogFiles:
+    """Retention cron (R8/C11): purge the worker's Files API uploads older than 5 min.
+
+    The schedule itself is not declared here — ``@workflow.define(schedules=...)`` is deprecated
+    and the worker registers no schedules (see ``entrypoints/worker.py``); the ``*/5 * * * *``
+    schedule on the ``update-github-log-worker`` deployment is created through the Workflows
+    schedules API (the app's ``schedules`` command) at deploy time.
+    """
+
+    @workflows.workflow.entrypoint
+    async def run(self, data: PurgeTestLogFilesInput) -> int:
+        return await purge_old_testlog_files(PurgeOldTestLogFilesInput())
+
+
 @workflows.activity(
     name="github-read-testlog",
     start_to_close_timeout=timedelta(seconds=30),
@@ -462,6 +712,13 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         if isinstance(value, (int, float)):
             existing.append(int(value))
     next_test_id = max(existing, default=0) + 1
+    published = await publish_testlog_file(
+        PublishTestLogFileInput(
+            base64_content=content_b64,
+            blob_sha=blob_sha,
+            file_name=os.path.basename(cfg["path"]),
+        )
+    )
     return SheetState(
         base64_content=content_b64,
         blob_sha=blob_sha,
@@ -469,6 +726,8 @@ async def read_testlog(_: ReadTestLogInput) -> SheetState:
         existing_test_ids=existing,
         headers=list(mapping.keys()),
         file_name=os.path.basename(cfg["path"]),
+        file_id=published.file_id,
+        signed_url=published.signed_url,
     )
 
 
@@ -614,6 +873,15 @@ async def verify_testlog(params: VerifyTestLogInput) -> VerifyResult:
     except (KeyError, ValueError, TypeError, OSError):
         raise workflows.WorkflowError("github_unexpected_response", non_retryable=True) from None
 
+    # Publish the post-commit blob, so an update's output points at the workbook as committed.
+    published = await publish_testlog_file(
+        PublishTestLogFileInput(
+            base64_content=body["content"],
+            blob_sha=str(body.get("sha") or ""),
+            file_name=os.path.basename(cfg["path"]),
+        )
+    )
+
     id_column = mapping["Test ID"]
     question_column = mapping["Question received"]
     for row in ws.iter_rows(min_row=cfg["header_row"] + 1, max_row=ws.max_row):
@@ -621,9 +889,9 @@ async def verify_testlog(params: VerifyTestLogInput) -> VerifyResult:
         if isinstance(test_id, (int, float)) and int(test_id) == params.test_id:
             question = row[question_column - 1].value if len(row) >= question_column else None
             if question == params.question:
-                return VerifyResult(verified=True, detail="row found with matching question")
-            return VerifyResult(verified=False, detail="row found but question differs")
-    return VerifyResult(verified=False, detail="row not found in file after commit")
+                return VerifyResult(verified=True, detail="row found with matching question", file_id=published.file_id, signed_url=published.signed_url)
+            return VerifyResult(verified=False, detail="row found but question differs", file_id=published.file_id, signed_url=published.signed_url)
+    return VerifyResult(verified=False, detail="row not found in file after commit", file_id=published.file_id, signed_url=published.signed_url)
 
 
 @workflows.workflow.define(name="update-github-log")
@@ -649,6 +917,8 @@ class UpdateGitHubLog:
                 dry_run=True,
                 test_id=test_id,
                 message=f"DRY RUN — would commit: {message}",
+                file_id=state.file_id,
+                signed_url=state.signed_url,
             )
         commit = await commit_testlog(
             CommitTestLogInput(
@@ -677,4 +947,6 @@ class UpdateGitHubLog:
             commit_url=commit.commit_url,
             file_url=commit.file_url,
             verified=True,
+            file_id=verify.file_id or state.file_id,
+            signed_url=verify.signed_url or state.signed_url,
         )
