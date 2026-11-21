@@ -13,6 +13,7 @@ from test_update_github_log import FakeFilesAPI, install_fake_files
 from worker.workflows import update_github_log
 from worker.workflows.update_github_log import (
     PURGE_MAX_AGE,
+    PublishedFile,
     PublishTestLogFileInput,
     PurgeOldTestLogFilesInput,
     publish_testlog_file,
@@ -47,6 +48,7 @@ async def test_purge_deletes_only_registered_entries_older_than_5_min(
     monkeypatch.setattr(update_github_log, "_now", clock)
     stale_at = clock.now - PURGE_MAX_AGE.total_seconds() - 1
     update_github_log._published_registry.update({"file-old": stale_at, "file-new": clock.now})
+    files.existing.update({"file-old", "file-new"})  # both exist remotely
 
     deleted = await purge_old_testlog_files(PurgeOldTestLogFilesInput())
 
@@ -93,6 +95,25 @@ async def test_purge_reconciles_the_cache_so_a_dead_file_id_is_reuploaded(
     assert len(files.uploads) == 2
 
 
+async def test_purge_treats_a_404_delete_as_already_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+    clock = Clock()
+    monkeypatch.setattr(update_github_log, "_now", clock)
+    update_github_log._published_registry["file-old"] = clock.now - PURGE_MAX_AGE.total_seconds() - 1
+    update_github_log._file_id_cache["blob-1"] = PublishedFile(
+        file_id="file-old", signed_url="https://files.test/signed/file-old?expiry=1"
+    )
+    files.delete_remotely("file-old")  # deleted manually: the worker's delete will 404
+
+    assert await purge_old_testlog_files(PurgeOldTestLogFilesInput()) == 1
+    assert files.deleted == []  # nothing was actually deleted remotely
+    assert update_github_log._published_registry == {}
+    assert update_github_log._file_id_cache == {}
+
+
 async def test_failed_delete_keeps_the_entry_for_the_next_tick(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -101,6 +122,7 @@ async def test_failed_delete_keeps_the_entry_for_the_next_tick(
     clock = Clock()
     monkeypatch.setattr(update_github_log, "_now", clock)
     update_github_log._published_registry["file-old"] = clock.now - PURGE_MAX_AGE.total_seconds() - 1
+    files.existing.add("file-old")
 
     assert await purge_old_testlog_files(PurgeOldTestLogFilesInput()) == 0
     assert files.deleted == []  # the delete was attempted and failed

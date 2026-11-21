@@ -450,6 +450,34 @@ def _now() -> float:
     return time.time()
 
 
+def _forget_published_file(file_id: str) -> None:
+    """Drop a file id from the purge registry, the blob-sha cache and the superseded tracker."""
+    global _last_published_file_id
+    _published_registry.pop(file_id, None)
+    for blob_sha, published in list(_file_id_cache.items()):
+        if published.file_id == file_id:
+            del _file_id_cache[blob_sha]
+    if _last_published_file_id == file_id:
+        _last_published_file_id = None
+
+
+async def _refresh_signed_url(client: object, published: PublishedFile, logger) -> PublishedFile:
+    """Re-mint the signed URL so every returned link has the full TTL (keeps the old one on failure)."""
+    try:
+        signed = await client.files.get_signed_url_async(
+            file_id=published.file_id, expiry=SIGNED_URL_EXPIRY_HOURS
+        )
+        published.signed_url = str(signed.url)
+    except Exception as error:
+        logger.warning(
+            "publish_testlog_file: signed url minting failed",
+            file_id=published.file_id,
+            error=type(error).__name__,
+            status=getattr(error, "status_code", None),
+        )
+    return published
+
+
 def _files_client() -> object:
     """The Mistral client for Files API calls. Tests monkeypatch this seam.
 
@@ -481,18 +509,36 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> PublishedFile
     URL (shortest TTL the API accepts) is minted next to it for clickable chat links; the
     retention purge bounds the effective link lifetime to ≤ 10 min. Results are cached by blob
     sha — an unchanged file is not re-uploaded — and when the blob changes the superseded upload
-    is deleted best-effort. Every upload is registered for the purge. A Mistral API call, so it
-    stays out of ``GITHUB_API_RATE_LIMIT``. Any upload failure resolves to an empty
-    ``PublishedFile`` so the inline artifact path keeps working; a signed-URL failure only
-    empties ``signed_url``; the key/token never appears in the result or the logs.
+    is deleted best-effort. On a cache hit the file's existence is checked
+    (``files.retrieve_async``): a 404 (e.g. a manual deletion outside the worker) evicts the id
+    from the cache/registry and re-uploads, any other error keeps the cached reference, and the
+    signed URL is re-minted so the returned link always has the full TTL. Every upload is
+    registered for the purge. A Mistral API call, so it stays out of
+    ``GITHUB_API_RATE_LIMIT``. Any upload failure resolves to an empty ``PublishedFile`` so the
+    inline artifact path keeps working; a signed-URL failure only empties ``signed_url``; the
+    key/token never appears in the result or the logs.
     """
     import base64
     import structlog
 
     logger = structlog.get_logger("workflows.publish_testlog_file")
     cached = _file_id_cache.get(params.blob_sha)
-    if cached:
-        return cached
+    if cached and cached.file_id:
+        client = _files_client()
+        try:
+            await client.files.retrieve_async(file_id=cached.file_id)
+        except Exception as error:
+            if getattr(error, "status_code", None) != 404:
+                # Transient or inconclusive: keep the cached reference, refresh only the link.
+                return await _refresh_signed_url(client, cached, logger)
+            logger.info(
+                "publish_testlog_file: cached upload is gone, re-uploading",
+                file_id=cached.file_id,
+                blob_sha=params.blob_sha,
+            )
+            _forget_published_file(cached.file_id)
+        else:
+            return await _refresh_signed_url(client, cached, logger)
     try:
         client = _files_client()
         content = base64.b64decode(params.base64_content)
@@ -506,19 +552,7 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> PublishedFile
             visibility="workspace",
         )
         file_id = str(upload.id)
-        signed_url = ""
-        try:
-            signed = await client.files.get_signed_url_async(
-                file_id=file_id, expiry=SIGNED_URL_EXPIRY_HOURS
-            )
-            signed_url = str(signed.url)
-        except Exception as error:
-            logger.warning(
-                "publish_testlog_file: signed url minting failed",
-                file_id=file_id,
-                error=type(error).__name__,
-                status=getattr(error, "status_code", None),
-            )
+        published = await _refresh_signed_url(client, PublishedFile(file_id=file_id), logger)
         global _last_published_file_id
         previous = _last_published_file_id
         if previous and previous != file_id:
@@ -531,14 +565,13 @@ async def publish_testlog_file(params: PublishTestLogFileInput) -> PublishedFile
                 )
             else:
                 _published_registry.pop(previous, None)
-        published = PublishedFile(file_id=file_id, signed_url=signed_url)
         _file_id_cache[params.blob_sha] = published
         _published_registry[file_id] = _now()
         _last_published_file_id = file_id
         logger.info(
             "publish_testlog_file: uploaded",
             file_id=file_id,
-            signed_url_minted=bool(signed_url),
+            signed_url_minted=bool(published.signed_url),
             blob_sha=params.blob_sha,
             size_bytes=len(content),
         )
@@ -569,14 +602,15 @@ async def purge_old_testlog_files(_: PurgeOldTestLogFilesInput) -> int:
     Only ids in the process-local registry are ever deleted — ``files.list`` is never used to
     select deletions, so foreign files (even same-named ones) are untouched. Purged ids are also
     dropped from the blob-sha cache and the superseded tracker, so a later read re-uploads instead
-    of returning a dead ``file_id``. Best-effort: a failed delete is logged (error class + HTTP
-    status, never the key) and the entry stays registered for the next tick. A Mistral API call,
-    so it stays out of ``GITHUB_API_RATE_LIMIT``.
+    of returning a dead ``file_id``. A 404 on delete means the file is already gone (e.g. deleted
+    manually outside the worker): the entry is dropped and the cache reconciled. Best-effort:
+    any other delete failure is logged (error class + HTTP status, never the key) and the entry
+    stays registered for the next tick. A Mistral API call, so it stays out of
+    ``GITHUB_API_RATE_LIMIT``.
     """
     import structlog
 
     logger = structlog.get_logger("workflows.purge_old_testlog_files")
-    global _last_published_file_id
     now = _now()
     max_age = PURGE_MAX_AGE.total_seconds()
     stale = [file_id for file_id, uploaded_at in _published_registry.items() if now - uploaded_at > max_age]
@@ -588,19 +622,17 @@ async def purge_old_testlog_files(_: PurgeOldTestLogFilesInput) -> int:
         try:
             await client.files.delete_async(file_id=file_id)
         except Exception as error:
-            logger.warning(
-                "purge_old_testlog_files: delete failed",
-                file_id=file_id,
-                error=type(error).__name__,
-                status=getattr(error, "status_code", None),
-            )
-            continue
-        _published_registry.pop(file_id, None)
-        for blob_sha, published in list(_file_id_cache.items()):
-            if published.file_id == file_id:
-                del _file_id_cache[blob_sha]
-        if _last_published_file_id == file_id:
-            _last_published_file_id = None
+            if getattr(error, "status_code", None) == 404:
+                logger.info("purge_old_testlog_files: already gone", file_id=file_id)
+            else:
+                logger.warning(
+                    "purge_old_testlog_files: delete failed",
+                    file_id=file_id,
+                    error=type(error).__name__,
+                    status=getattr(error, "status_code", None),
+                )
+                continue
+        _forget_published_file(file_id)
         deleted += 1
         logger.info("purge_old_testlog_files: deleted", file_id=file_id)
     return deleted

@@ -59,8 +59,44 @@ async def test_unchanged_blob_is_not_reuploaded(monkeypatch: pytest.MonkeyPatch)
 
     assert first == second
     assert first.file_id == "file-1"
-    assert len(files.uploads) == 1
-    assert len(files.signed_urls) == 1  # cache hit: no second mint either
+    assert len(files.uploads) == 1  # cache hit: no re-upload
+    assert files.retrieved == ["file-1"]  # but the existence check ran
+    assert len(files.signed_urls) == 2  # and the signed URL was re-minted (full TTL on the hit)
+
+
+async def test_cache_hit_reuploads_when_the_file_was_deleted_remotely(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+
+    first = await publish_testlog_file(make_input("blob-1"))
+    assert first.file_id == "file-1"
+
+    files.delete_remotely("file-1")  # manual deletion outside the worker
+
+    second = await publish_testlog_file(make_input("blob-1"))
+    assert second.file_id == "file-2"  # re-uploaded, not the dead file-1
+    assert len(files.uploads) == 2
+    assert files.retrieved == ["file-1"]
+    assert files.signed_urls[-1]["file_id"] == "file-2"
+    assert update_github_log._file_id_cache["blob-1"].file_id == "file-2"
+    assert list(update_github_log._published_registry) == ["file-2"]
+    assert update_github_log._last_published_file_id == "file-2"
+
+
+async def test_cache_hit_with_transient_retrieve_error_keeps_the_cached_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    files = FakeFilesAPI()
+    install_fake_files(monkeypatch, files)
+
+    first = await publish_testlog_file(make_input("blob-1"))
+    files.fail_retrieve = True  # existence check now fails transiently
+
+    second = await publish_testlog_file(make_input("blob-1"))
+    assert second.file_id == first.file_id == "file-1"
+    assert len(files.uploads) == 1  # no re-upload on a transient error
 
 
 async def test_changed_blob_uploads_again_and_deletes_the_superseded_file(
