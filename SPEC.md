@@ -1,6 +1,6 @@
 # SPEC — Direct download of `Response Repository Matrix.xlsx`
 
-- **Status:** draft
+- **Status:** revised 2026-11-21 — see §11 (deployed-worker findings and revised direction). Phase 1 (the ingress-served `api` module + `download_url`/`download_url_detail` outputs) is implemented on this branch; the prioritized mechanism for R1 is now the Files API (§11).
 - **Branch:** `directDownload`
 - **Scope:** let an authenticated user download the current test-log workbook directly from the deployed app (`GET /download`), without going through a chat agent — and let the chat surface that link after each update and on request (R7).
 
@@ -119,3 +119,30 @@ Downloads are read-only and idempotent. Concurrent *updates* remain guarded by t
 - Authorization = platform-authenticated caller allowed to execute `download-testlog` (optionally narrowed by an allowlist later).
 - Fetch path = start a `download-testlog` execution and await its result (keeps the rate-limited read path); direct GitHub GET kept as documented fallback under C5/C6.
 - Chat link (R7): new config var `APP_DOWNLOAD_URL` bound at deploy time to the `update-github-log-api` module URL; shown as a `ButtonLink` where the UI supports it, as a raw link otherwise; the artifact stays as fallback.
+- 2026-11-21: direct download without the chat is prioritized via the **Mistral Files API** (`file_id` in the workflow result, authenticated download via `GET /v1/files/{file_id}/content`) — see §11. Signed URLs are not the primary mechanism (unauthenticated for their TTL, 1–168 h, conflicting with R2/C1/C10); object storage via bound S3/GCS/Azure secrets is rejected as primary (new long-lived credential + bucket lifecycle ops, no security gain). The inline base64 result stays unchanged as the chat artifact fallback.
+- 2026-11-21: the `api` module's URL cannot be auto-discovered from `/v1/workflows/deployments` (it lists only managed worker deployments — see §11); bind `APP_DOWNLOAD_URL` at deploy time to its URL. Auto-discovery remains best-effort only.
+- 2026-11-21: both workflow outputs also carry `download_url_detail`, a secret-free explanation of how `download_url` was resolved (source + steps/outcome), for diagnosability.
+
+## 11. Findings from the deployed worker and revised direction (2026-11-21)
+
+Live observation (worker `update-github-log-worker` at `b10547f`), returned as `download_url_detail` in a `download-testlog` result:
+
+```
+unresolved: GET /v1/workflows/deployments/app-workspace-api -> HTTP 404; GET /v1/workflows/deployments -> 1 deployment(s) [update-github-log-worker]; none named *-api with an https endpoint
+```
+
+Conclusions:
+
+- The worker's service-account token can read the deployments API and `WORKFLOWS_BASE_URL` is https, so the resolution pipeline itself works; the failure is purely "no such entry".
+- `APP_NAME` is not bound on the worker deployment, so the name probe used the package default `app-workspace` (`app-workspace-api` → 404).
+- `/v1/workflows/deployments` lists only managed **worker** deployments (`mistral apps deploy` creates exactly one, `<app>-worker`). The `api` module (`serve: "server"`) is deployed as an app/space module (`/v1/spaces/{id}/modules/api/deploy`) and **never appears in that API** — there is no list-spaces endpoint, and the worker does not know its space id. Auto-discovery of the api module URL from the deployments API therefore cannot work; the URL must be bound via `APP_DOWNLOAD_URL` (from the Console / deploy output).
+- A managed worker container exposes no shell, exec, or filesystem, and shares no volume with the caller: a file produced inside a workflow run is reachable only if the worker returns it inline or pushes it out itself.
+
+Revised priority for R1 (direct download without the chat intermediary):
+
+1. **Mistral Files API (chosen).** A new `publish-testlog-file` activity uploads the workbook bytes with the worker's SA-token client (`visibility="workspace"`; 512 MB per-file cap ≫ the ~30 KB workbook; `expiry` on upload plus `files.list`/`files.delete` for cleanup; cache by blob sha so only changed files are re-uploaded). The activity runs inside the workflow read path (determinism rule; not under `GITHUB_API_RATE_LIMIT` — it is a Mistral API call). Both `download-testlog` and `update-github-log` outputs gain `file_id`. Callers download with their own bearer token: `curl -H "Authorization: Bearer <their token>" "$WORKFLOWS_BASE_URL/v1/files/<file_id>/content" -o "Response Repository Matrix.xlsx"`, or `client.files.download(file_id)` — one authenticated call, no chat, no GitHub access. `file_id` alone is not a capability: `/v1/files/{file_id}/content` requires auth. Verify the accepted `purpose` value against the live API first (SDK literals are `fine-tune`/`batch`/`ocr`/`agentic_safety`; `ocr` is the usual arbitrary-document purpose).
+2. **Signed URLs — optional convenience only, never primary.** `client.files.get_signed_url(file_id, expiry=…)` yields an unauthenticated URL valid 1–168 h (default 24 h); that is "anyone with the link" access and conflicts with R2/C1/C10 for a private workbook. If a one-click browser link is wanted, the chat should request a signed URL on demand with the minimum TTL; the worker must not bake a long-lived signed URL into the result.
+3. **Object storage (S3/GCS/Azure via deployment secrets)** — rejected as primary: a new long-lived credential to bind/rotate, bucket retention and CORS ops, and no security gain over option 1.
+4. **Inline base64** — stays exactly as it is (chat artifact fallback); not being improved.
+
+The ingress-served `api` module implemented on this branch remains the best UX when it is deployed and `APP_DOWNLOAD_URL` is bound to its URL (single authenticated `GET /download`, proper `Content-Disposition`, audit log, no storage at all); it needs no deployments-API discovery for access, only for the optional URL auto-discovery. `download_url`/`download_url_detail` already report how the URL was resolved (`override` / `deployment-name` / `deployments-list` / `unresolved` plus the steps), which is how the findings above were obtained.

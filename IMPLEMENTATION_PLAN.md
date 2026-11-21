@@ -2,7 +2,9 @@
 
 - **Implements:** `SPEC.md` (same branch, `directDownload`)
 - **Branch:** `directDownload`
-- **Approach in one line:** add an authenticated `api` module serving `GET /download` (raw bytes, caller auth at the platform ingress, fetch via a `download-testlog` execution), and plumb the download URL into the worker workflow outputs (`download_url`) so the chat skill can show the link (R7). The worker module itself is not turned into an HTTP server.
+- **Status:** phase 1 implemented and pushed (`d31798a`, `b387d46`, `b10547f`); phase 2 (Files API, §7) is documented only — **not started** per owner instruction of 2026-11-21. See `SPEC.md` §11 for the deployed-worker findings that drove the revision.
+- **Approach in one line (phase 1, done):** an authenticated `api` module serving `GET /download` (raw bytes, caller auth at the platform ingress, fetch via a `download-testlog` execution), plus `download_url`/`download_url_detail` on the worker workflow outputs so the chat skill can show the link (R7). The worker module itself is not turned into an HTTP server.
+- **Approach in one line (phase 2, not started):** the worker pushes the workbook to the Mistral Files API in an activity and returns `file_id` on the outputs; callers download via the authenticated `GET /v1/files/{file_id}/content` with their own token. Inline base64 stays as the chat fallback.
 
 ## 1. File-by-file changes
 
@@ -53,10 +55,11 @@
 
 ## 3. Order of work
 
-1. Worker `download_url` plumbing + tests (no deploy needed; pure additive field).
-2. `api` module: `mistral.json` entry, `apps/api` package + `project.json`, `Dockerfile.api`, tests.
-3. `.env.example` + `README.md`.
-4. Deploy (see §4). No manual URL binding is needed: once the `api` module is deployed, the worker auto-discovers the `update-github-log-api` URL (see §2, download-URL resolution); `APP_DOWNLOAD_URL` is only an optional override.
+1. Worker `download_url` plumbing + tests — **done** (`d31798a`, `b387d46`, `b10547f`), including the `resolve-download-url` guessing (name lookup, then active `*-api` deployments) with the `download_url_detail` explanation field and its unit tests.
+2. `api` module: `mistral.json` entry, `apps/api` package + `project.json`, `Dockerfile.api`, tests — **done** (`d31798a`; 9 tests green).
+3. `.env.example` + `README.md` — **done**.
+4. Deploy (see §4). **Correction to the earlier note:** the worker cannot auto-discover the `update-github-log-api` URL from the deployments API — that API lists only managed worker deployments and the `api` module never appears there (`SPEC.md` §11). Bind `APP_DOWNLOAD_URL` at deploy time to the api module's URL from the Console / deploy output; auto-discovery stays best-effort. Also consider binding `APP_NAME=update-github-log` on the worker so the name probe is correct.
+5. Phase 2 — Files API direct download (see §7): **not started**.
 
 ## 4. Build, deploy, verify
 
@@ -76,4 +79,17 @@
 
 ## 6. Mapping to SPEC acceptance criteria
 
-AC1 → §1.2 `mistral.json`; AC2/AC3/AC4/AC5/AC6 → §2 handler + api tests; AC7 → §4 test/lint commands; AC8/AC12 → §1.3 README + §1.4 skill; AC9 → C1 (no exposure mechanisms anywhere in the diff); AC10 → worker tests unchanged apart from the new `download_url` cases; AC11 → §1.1.
+AC1 → §1.2 `mistral.json`; AC2/AC3/AC4/AC5/AC6 → §2 handler + api tests; AC7 → §4 test/lint commands; AC8/AC12 → §1.3 README + §1.4 skill; AC9 → C1 (no exposure mechanisms anywhere in the diff); AC10 → worker tests unchanged apart from the new `download_url` cases; AC11 → §1.1. Phase 2 (`SPEC.md` §11) will add its own ACs (file_id present and downloadable with a caller token, no secret in outputs, cleanup) when started.
+
+## 7. Phase 2 — Files API direct download (documented, NOT started)
+
+Owner decision 2026-11-21: the inline base64 result stays as-is (chat artifact fallback); the prioritized direct-download mechanism is the worker pushing the file to the Mistral Files API and returning a reference. Findings in `SPEC.md` §11 (managed worker containers expose nothing; the api module is not a workflows deployment, so `APP_DOWNLOAD_URL` binding is required for the `api`-module path).
+
+| File | Change (when started) |
+|---|---|
+| `workflow/apps/worker/src/worker/workflows/update_github_log.py` (new activity) | `publish-testlog-file`: uploads the workbook bytes via the SA-token Mistral client (`client.files.upload`, `visibility="workspace"`, `expiry` set, purpose verified against the live API — `ocr` expected), caches by blob sha so unchanged files are not re-uploaded, deletes the previous upload when the blob changes. Inside an activity only; not under `GITHUB_API_RATE_LIMIT`. |
+| `workflow/apps/worker/src/worker/workflows/update_github_log.py` / `download_testlog.py` | `SheetState` and both outputs gain `file_id: str = ""` (and optionally a short-TTL `signed_url` only if the owner asks — never long-lived, per SPEC §11). |
+| `workflow/apps/worker/tests/` | Mocked Files API: file_id present when the upload succeeds, empty on failure, no token material in outputs, re-upload skipped when blob sha unchanged. |
+| `README.md`, `workflow/.env.example` | Document the Files API flow (caller: `curl -H "Authorization: Bearer <token>" …/v1/files/<file_id>/content -o …` or `client.files.download(file_id)`), and that `download_url`/`download_url_detail` now describe either the api-module URL or the file reference. |
+
+Explicitly out of phase 2: signed URLs as the primary access mechanism (unauthenticated for 1–168 h — violates R2/C1/C10), external object storage (extra bound credential + bucket ops, no gain), any change to the inline base64 path.
