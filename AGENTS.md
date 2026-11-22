@@ -29,3 +29,15 @@ still usable:
 This avoids a common failure mode: the owner merges a PR while the agent
 is still working, so a later commit lands on a dead branch and never
 reaches `main`.
+
+# Spec and plan files
+
+Before starting an implementation, create `SPEC.md` (requirements,
+constraints, acceptance criteria, decisions) and `IMPLEMENTATION_PLAN.md`
+(file-by-file changes, order of work, verification steps) at the repository
+root, and work from them.
+
+When the implementation is done, move both files into `archive/` and rename
+them with the completion date as a midfix — `SPEC.<yyyymmdd>.md` and
+`IMPLEMENTATION_PLAN.<yyyymmdd>.md` (e.g. `SPEC.20261123.md`) — so the root
+only ever holds the spec and plan of the work currently in progress.
