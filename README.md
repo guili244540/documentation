@@ -1,5 +1,5 @@
-# documentation
-A place to store our documentation.
+# Chat quality log
+A place to keep track and evaluate our chat for reuse.
 
 ## Contents
 
