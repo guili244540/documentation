@@ -19,8 +19,8 @@ A place to keep track and evaluate our chat for reuse.
 
 **Design rules.**
 
-- Workflow code stays deterministic: every side effect and every environment read happens inside an activity, never in the workflow body (the file name comes from the activity, not from `os.environ` in the workflow).
-- Repo, path, branch, sheet and header row are worker configuration (`GITHUB_LOG_*` variables, declared in `workflow/.env.example`), not workflow input.
+- Workflow code stays deterministic.
+- Repo, path, branch, sheet and header row are worker configuration.
 - Columns are matched by header name and categorical fields are validated against the `Lists` sheet, so extra or reordered columns do not break the append.
 
 **Layout and tests.** Workflow definitions and activities live in `workflow/apps/worker/src/worker/workflows/`; tests run against a mocked GitHub API in `workflow/apps/worker/tests/` (`cd workflow && bash tools/uv.sh run --all-packages pytest apps/worker`). The worker image is built from `workflow/deploy/docker/Dockerfile.worker`; app wiring is in `workflow/mistral.json`.
